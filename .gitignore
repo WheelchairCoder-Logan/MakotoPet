@@ -1,0 +1,64 @@
+# ============================================================
+#  本机配置 / 运行产物 —— 一律不入库
+# ============================================================
+
+# 含密钥与个人设置的配置文件（只提交 *.example.ini）
+config.ini
+llm.ini
+stats.ini
+prompt.txt
+
+# 素材：立绘序列帧、音频、模型（体积大且通常有版权，见 README）
+Animations/
+AnimCache/
+BGM/
+Sound/
+*.pth
+*.index
+*.onnx
+*.wav
+*.mp3
+*.ogg
+*.flac
+*.ico
+
+# 对话记录 / 缓存 / 日志
+history*.txt
+*.log
+__pycache__/
+*.pyc
+
+# Visual Studio
+.vs/
+Debug/
+Release/
+x64/
+x86/
+*.user
+*.suo
+*.pdb
+*.obj
+*.ilk
+*.exe
+*.dll
+*.exp
+*.lib
+*.tlog
+*.idb
+*.aps
+*.ncb
+*.opendb
+*.VC.db
+*.VC.opendb
+
+# 打包产物
+*.zip
+*.7z
+*.rar
+
+# 系统与编辑器
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*~
