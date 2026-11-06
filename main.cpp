@@ -1,4 +1,4 @@
-﻿// ============================================================================
+// ============================================================================
 //  MakotoPet —— 一个跑在 Windows 桌面上的桌宠：常陆茉子
 //  Copyright (c) 2025 MakotoPet contributors
 //  Licensed under the MIT License.  See LICENSE / NOTICE in the repository root.
@@ -107,6 +107,7 @@ int g_currentH = BASE_H;
 #define WM_TRAY (WM_USER + 1)
 #define WM_APP_PRELOAD_DONE (WM_APP + 1)   // 素材全量加载完成，可以显示人物了
 #define WM_APP_AFFINITY     (WM_APP + 2)   // 对话好感度增减（wParam = delta + 16，便于传负数）
+#define WM_APP_RVC_DONE     (WM_APP + 3)   // 翻唱成功，回主线程结算统计
 #define AFFINITY_MSG_BIAS   16
 #define ID_TRAY_SHOW 100
 #define ID_TRAY_AUTOSTART 101
@@ -193,10 +194,13 @@ static ULONGLONG    g_lastAchCheckMs = 0;     // 成就定期判定
 static IXAudio2* g_xa = nullptr;
 static IXAudio2MasteringVoice* g_master = nullptr;
 
+struct SfxCallback;   // 完整定义在下面；XSound 只保存它的指针
+
 struct XSound {
     WAVEFORMATEX wfx{};
     std::vector<BYTE> pcm;
     IXAudio2SourceVoice* v = nullptr;
+    SfxCallback* myCb = nullptr;   // 本对象固定占用的回调槽，寿命内不更换
     bool loaded = false;
     bool playing = false;
     void Reset() {
@@ -219,7 +223,7 @@ struct SfxCallback : public IXAudio2VoiceCallback {
 //   旧声音的 playing 标志永远不会被 OnBufferEnd 复位。
 //   当前对象：bgm/startup/exit/think/peace/tts/rvcCover + costume[3] = 9，留足余量用 16。
 static SfxCallback g_sfxCb[16];
-static int g_sfxCbIdx = 0;
+static std::atomic<int> g_sfxCbIdx{ 0 };
 
 static XSound g_bgm, g_startup, g_exit, g_think, g_peace, g_costume[3];
 static XSound g_tts; // TTS 音频
@@ -354,7 +358,12 @@ static bool LoadWav(const wchar_t* path, XSound& s) {
             if (cs) ReadFile(h, s.pcm.data(), cs, &rd, nullptr);
             gotdata = true;
         }
-        pos += 8 + cs + (cs & 1);
+        // cs 来自文件头，畸形文件可能给到 0xFFFFFFxx；直接相加会让 DWORD
+        // 回绕成很小的值，循环条件重新成立 → 死循环。三处 WAV 解析都要防。
+        unsigned long long step = 8ull + cs + (cs & 1u);
+        unsigned long long next = (unsigned long long)pos + step;
+        if (next > 0xFFFFFFFFull) break;
+        pos = (DWORD)next;
     }
     CloseHandle(h);
     if (!gotfmt || !gotdata || s.pcm.empty() || s.wfx.nChannels == 0) return false;
@@ -386,7 +395,12 @@ static bool LoadWavFromMemory(const std::vector<char>& wavData, XSound& s) {
             if (take) memcpy(s.pcm.data(), wavData.data() + pos + 8, take);
             gotdata = true;
         }
-        pos += 8 + cs + (cs & 1);
+        // cs 来自文件头，畸形文件可能给到 0xFFFFFFxx；直接相加会让 DWORD
+        // 回绕成很小的值，循环条件重新成立 → 死循环。三处 WAV 解析都要防。
+        unsigned long long step = 8ull + cs + (cs & 1u);
+        unsigned long long next = (unsigned long long)pos + step;
+        if (next > 0xFFFFFFFFull) break;
+        pos = (DWORD)next;
     }
     if (!gotfmt || !gotdata || s.pcm.empty() || s.wfx.nChannels == 0) return false;
     s.loaded = true; return true;
@@ -407,10 +421,12 @@ static void WaitForSoundToFinish(XSound& s, DWORD timeoutMs = 2000) {
 static void XSoundPlay(XSound& s, bool loop) {
     if (!g_xa || !s.loaded) return;
     if (!s.v) {
-        SfxCallback* cb = &g_sfxCb[g_sfxCbIdx++ % 16];
-        cb->s = &s; s.playing = false;
+        // 每个声音对象固定领一个回调槽，寿命内不换：轮询复用会让旧声音的
+        // OnBufferEnd 改写新声音的 playing 标志，播放状态会永久卡死。
+        if (!s.myCb) s.myCb = &g_sfxCb[g_sfxCbIdx.fetch_add(1) % 16];
+        s.myCb->s = &s; s.playing = false;
         HRESULT hr = g_xa->CreateSourceVoice(&s.v, &s.wfx, 0,
-            XAUDIO2_DEFAULT_FREQ_RATIO, cb, nullptr, nullptr);
+            XAUDIO2_DEFAULT_FREQ_RATIO, s.myCb, nullptr, nullptr);
         if (FAILED(hr)) { s.v = nullptr; return; }
     }
     XAUDIO2_VOICE_STATE st{};
@@ -662,6 +678,9 @@ struct PetStats {
     unsigned int unlockAck = 0;     // 已弹过提示的解锁项位图（只影响是否再弹一次）
 };
 static PetStats g_stat;
+// 统计数据的写入方不止主线程（RVC 后台线程也会结算好感并落盘）。
+// 用同一把递归锁包住所有写入与存档，避免并发改写把 stats.ini 写成半截。
+static std::recursive_mutex g_statMtx;
 
 struct AchDef { int bit; const wchar_t* icon; const wchar_t* name; const wchar_t* desc; };
 static const AchDef ACH_DEF[ACH_COUNT] = {
@@ -827,6 +846,7 @@ static int DaysSinceFirstMeet() {
 }
 
 static void StatsLoad() {
+    std::lock_guard<std::recursive_mutex> lk(g_statMtx);
     std::wstring ini;
     if (!StatsIniPath(ini)) return;
     wchar_t b[64];
@@ -862,6 +882,7 @@ static void StatsLoad() {
 }
 
 static void StatsSave() {
+    std::lock_guard<std::recursive_mutex> lk(g_statMtx);
     std::wstring ini;
     if (!StatsIniPath(ini)) return;
     wchar_t b[64];
@@ -885,6 +906,7 @@ static void StatsSave() {
 
 // 跨天处理：重置每日好感度、更新连续天数与累计天数
 static void StatsCheckDay() {
+    std::lock_guard<std::recursive_mutex> lk(g_statMtx);
     wchar_t today[16]; TodayStr(today);
     if (g_stat.firstMeet[0] == 0) {
         wcsncpy_s(g_stat.firstMeet, 16, today, 15);
@@ -937,6 +959,7 @@ static bool AffinityMaxed() { return g_stat.affinityTotal >= AFFINITY_CAP; }
 
 // 增加好感度（受每日上限约束）。返回值=是否真的加进去了
 static bool StatsAddAffinity(int n) {
+    std::lock_guard<std::recursive_mutex> lk(g_statMtx);
     if (n <= 0) return false;
     // 已经填满就停止累计：数字停在满值，爱心永久全满。
     // 否则"心意已满"之后还会看到 300 → 487 这种没有意义的小数增长。
@@ -962,6 +985,7 @@ static bool StatsAddAffinity(int n) {
 // 累计值只增，解锁永不回退，爱心也不会被扣空。
 // 返回 true 表示本轮确实"获得"了好感（用于区分"没加分"和"今日已达上限"）。
 static bool StatsAddAffinityChat(int delta) {
+    std::lock_guard<std::recursive_mutex> lk(g_statMtx);
     if (delta == 0) return false;
     if (delta < 0) {
         g_stat.affinityMood += delta;
@@ -1836,7 +1860,9 @@ static unsigned long       g_cacheTick = 0;
 
 static void FrameCacheEvictIfNeeded(int keepC1, int keepS1, int keepC2, int keepS2) {
     std::lock_guard<std::recursive_mutex> lk(g_frameMtx);
-    while (g_cacheSetCount >= FRAME_CACHE_MAX) {
+    // 16 套全部常驻是设计目标：等于上限时不要淘汰，否则任何一套重建都会
+    // 把其余 14 套清掉，切换动作又回到边播边解码。
+    while (g_cacheSetCount > FRAME_CACHE_MAX) {
         int bc = -1, bs = -1;
         unsigned long best = 0;
         for (int c = 0; c < 4; ++c)
@@ -2887,6 +2913,7 @@ static bool CallTTSService(const std::wstring& jaText, std::wstring* errOut) {
     //   而且服务刚启动时还容易撞上超时。
     static std::wstring            s_probeKey;
     static std::vector<std::wstring> s_probePaths;
+    static std::recursive_mutex    s_probeMtx;   // 探测缓存可能被两个线程同时访问
     std::wstring probeKey = host + L":" + std::to_wstring(port);
 
     std::vector<std::wstring> paths;
@@ -2897,11 +2924,14 @@ static bool CallTTSService(const std::wstring& jaText, std::wstring* errOut) {
     if (!cfgPath.empty()) {
         pushPath(cfgPath);
     } else {
-        if (probeKey != s_probeKey) {
-            s_probePaths = TtsDiscoverPaths(host, port);
-            s_probeKey = probeKey;
+        {
+            std::lock_guard<std::recursive_mutex> lk(s_probeMtx);
+            if (probeKey != s_probeKey) {
+                s_probePaths = TtsDiscoverPaths(host, port);
+                s_probeKey = probeKey;
+            }
+            for (const auto& pp : s_probePaths) pushPath(pp);
         }
-        for (const auto& pp : s_probePaths) pushPath(pp);
     }
     // ★ 兜底候选里【不再放 "/"】：GPT-SoVITS 从来没有 POST / 这个端点，
     //   放进去只会让真正出错时，原因被伪装成最后一个路径的 404
@@ -3115,14 +3145,34 @@ static std::wstring LoadChatHistory() {
     if (!GetExeDir(exeDir)) return L"";
     std::wstring historyPath = exeDir + L"\\chat_history.txt";
     if (!PathFileExistsW(historyPath.c_str())) return L"";
+    // 历史文件会一直追加。只读末尾一段：否则聊天久了发给模型的上下文
+    // 永远停在最早那几轮，最近说过的话反而看不见，内存也会无限增长。
+    const long long kMaxRead = 128 * 1024;
     FILE* f = nullptr;
-    _wfopen_s(&f, historyPath.c_str(), L"r, ccs=UTF-8");
+    _wfopen_s(&f, historyPath.c_str(), L"rb");
     if (!f) return L"";
-    std::vector<wchar_t> content(32768, L'\0');     // 原为 64KB 栈数组，改堆分配
+    _fseeki64(f, 0, SEEK_END);
+    long long sz = _ftelli64(f);
+    if (sz <= 0) { fclose(f); return L""; }
+    long long start = (sz > kMaxRead) ? (sz - kMaxRead) : 0;
+    _fseeki64(f, start, SEEK_SET);
+    std::string bytes((size_t)(sz - start), '\0');
 #pragma warning(suppress:6031)
-    size_t nread = fread(content.data(), sizeof(wchar_t), 32767, f);
+    size_t nread = bytes.empty() ? 0 : fread(&bytes[0], 1, bytes.size(), f);
     fclose(f);
-    std::wstring history(content.data(), nread);
+    bytes.resize(nread);
+    // 截断处可能落在 UTF-8 多字节序列中间，先丢掉开头的续字节
+    size_t skip = 0;
+    while (skip < bytes.size() &&
+           ((unsigned char)bytes[skip] & 0xC0) == 0x80) ++skip;
+    if (skip) bytes.erase(0, skip);
+    if (bytes.size() >= 3 && (unsigned char)bytes[0] == 0xEF &&
+        (unsigned char)bytes[1] == 0xBB && (unsigned char)bytes[2] == 0xBF) bytes.erase(0, 3);
+    int n = MultiByteToWideChar(CP_UTF8, 0, bytes.c_str(), (int)bytes.size(), nullptr, 0);
+    if (n <= 0) return L"";
+    std::wstring history((size_t)n, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, bytes.c_str(), (int)bytes.size(), &history[0], n);
+    // RichEdit 需要 CRLF
     size_t pos = 0;
     while ((pos = history.find(L"\n", pos)) != std::wstring::npos) {
         if (pos == 0 || history[pos - 1] != L'\r') { history.replace(pos, 1, L"\r\n"); pos += 2; }
@@ -3188,7 +3238,13 @@ static unsigned __stdcall LLMThreadProc(void* param) {
     std::wstring prompt = LoadPrompt();
     std::wstring history = LoadChatHistory();
     size_t histMax = (size_t)GetLLMConfigInt(L"HistoryMaxChars", 4000, 500, 60000);
-    if (history.size() > histMax) history = history.substr(history.size() - histMax);
+    if (history.size() > histMax) {
+        size_t cut = history.size() - histMax;
+        // wstring::substr 按 UTF-16 码元切，可能把代理对（emoji / 扩展汉字）
+        // 劈成孤立的低代理项，JSON 转义后就是非法 UTF-16。多退一个码元即可。
+        if (cut < history.size() && history[cut] >= 0xDC00 && history[cut] <= 0xDFFF) ++cut;
+        history = history.substr(cut);
+    }
     // ★ 历史放进独立的 system 消息，而不是塞成一条 assistant 消息。
     //   不能把整段历史原样发回：模型会把"主人：xx / 茉子：xx"当成自己以前说过的话，
     //   于是它开始模仿历史里的纯文本格式，不再输出要求的 JSON，回复也变得又短又乱。
@@ -3207,6 +3263,13 @@ static unsigned __stdcall LLMThreadProc(void* param) {
     double freqPen = GetLLMConfigDouble(L"FrequencyPenalty", 0.3, -2.0, 2.0);
     int    maxTokens = GetLLMConfigInt(L"MaxTokens", 3000, 256, 16384);
     int    enableThink = GetLLMConfigInt(L"EnableThinking", 0, 0, 1);
+
+    // ★ 这三个开关决定要不要把非通用字段发给网关。OpenAI 官方、DeepSeek、Kimi、智谱
+    //   以及多数中转站都不认 chat_template_kwargs；部分网关也不支持 response_format。
+    //   原代码是硬编码全发，碰到不认的网关就返回 400、取不到 content。
+    int    usePenalty = GetLLMConfigInt(L"UsePenalty", 1, 0, 1);
+    int    useFmt = GetLLMConfigInt(L"UseResponseFormat", 1, 0, 1);
+    int    useKw = GetLLMConfigInt(L"UseChatTemplateKwargs", 0, 0, 1);
 
     // ★ 长文本模式：放宽上限 + 追加一次性指令
     bool longForm = IsLongFormRequest(userInput);
@@ -3232,11 +3295,21 @@ static unsigned __stdcall LLMThreadProc(void* param) {
         L"\"}" + contextStr + L",{\"role\":\"user\",\"content\":\"" + EscapeJsonW(userInput) +
         L"\"}],\"stream\":false,\"max_tokens\":" + std::to_wstring(maxTokens) +
         L",\"temperature\":" + numToW(temperature) +
-        L",\"top_p\":" + numToW(topP) +
-        L",\"presence_penalty\":" + numToW(presencePen) +
-        L",\"frequency_penalty\":" + numToW(freqPen) +
-        L",\"response_format\":{\"type\":\"json_object\"},\"chat_template_kwargs\":{\"enable_thinking\":"
-        + (enableThink ? L"true" : L"false") + L"}}";
+        L",\"top_p\":" + numToW(topP);
+    // ★ 非通用字段按开关拼接：关掉就一个字都不发，网关不会再因为不认识而报 400
+    if (usePenalty) {
+        jsonBodyW += L",\"presence_penalty\":" + numToW(presencePen) +
+            L",\"frequency_penalty\":" + numToW(freqPen);
+    }
+    if (useFmt) {
+        jsonBodyW += L",\"response_format\":{\"type\":\"json_object\"}";
+    }
+    if (useKw) {
+        jsonBodyW += L",\"chat_template_kwargs\":{\"enable_thinking\":";
+        jsonBodyW += (enableThink ? L"true" : L"false");
+        jsonBodyW += L"}";
+    }
+    jsonBodyW += L"}";
 
 
     std::string jsonBodyUtf8 = WideStringToUtf8(jsonBodyW);
@@ -3280,7 +3353,22 @@ static unsigned __stdcall LLMThreadProc(void* param) {
         PostMessageW(hwnd, WM_STREAM_DONE, 0, 0);
         return 0;
     }
-    WinHttpReceiveResponse(hRequest, NULL);
+    // 不检查返回值的话，代理认证失败(407)、TLS 被拦截时会静默失败，
+    // 后面读到一个空响应，界面只会显示"解析回复失败"，完全看不出原因。
+    if (!WinHttpReceiveResponse(hRequest, NULL)) {
+        WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
+        auto* msg = new std::wstring(L"接收响应失败（WinHttpReceiveResponse）：多为代理认证失败或网络被拦截");
+        if (!PostMessageW(hwnd, WM_APPEND_TEXT, 0, (LPARAM)msg)) delete msg;
+        PostMessageW(hwnd, WM_STREAM_DONE, 0, 0);
+        return 0;
+    }
+    int httpStatus = 0;
+    {
+        DWORD code = 0, cs = sizeof(code);
+        if (WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_HEADER_NAME_BY_INDEX, &code, &cs, WINHTTP_NO_HEADER_INDEX))
+            httpStatus = (int)code;
+    }
 
     std::string fullResponse;
     DWORD dwSize = 0, dwDownloaded = 0;
@@ -3293,11 +3381,18 @@ static unsigned __stdcall LLMThreadProc(void* param) {
     }
     WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
 
+    std::string serverErr;   // 服务端返回的具体报错原因
     if (fullResponse.find("\"error\"") != std::string::npos) {
         // ★ 完整响应里包含对话正文，默认不输出，排查时才开 PET_ENABLE_DEBUG_LOG
         PetDbgA("[LLM] error response begin\n");
         PetDbgA(fullResponse.c_str());
         PetDbgA("\n[LLM] error response end\n");
+        // ★ 把服务端说的具体原因取出来，直接显示在聊天窗口里，
+        //   不用再开日志去猜是 401、404 还是不认识某个字段
+        serverErr = ExtractJsonString(fullResponse, "message");
+        if (serverErr.empty()) serverErr = ExtractJsonString(fullResponse, "msg");
+        if (serverErr.empty()) serverErr = ExtractJsonString(fullResponse, "error");
+        if (serverErr.empty()) serverErr = "服务端返回了 error 字段（完整响应见 VS 输出窗口）";
     }
 
     std::string assistantRaw = ExtractAssistantContent(fullResponse);
@@ -3313,6 +3408,7 @@ static unsigned __stdcall LLMThreadProc(void* param) {
     //   结算放在打字机跑完、历史已存档之后，界面上的顺序才不会串。
     int affDelta = ExtractJsonInt(jsonObj, "affection", 1, -3, 5);
     {
+        std::lock_guard<std::recursive_mutex> lk(g_statMtx);
         // ★ 排查用：VS 输出窗口搜 [AFF] 就能看到模型这一轮到底给了几分
         char dbg[192];
         _snprintf_s(dbg, sizeof dbg, _TRUNCATE,
@@ -3323,10 +3419,31 @@ static unsigned __stdcall LLMThreadProc(void* param) {
         PetDbgA(dbg);
     }
 
+    // ★ 模型可能把字段名写成中文或别的叫法，按顺序试一遍，别让整轮对话白跑
+    if (zhUtf8.empty()) {
+        static const char* altZh[] = { "中文", "cn", "chinese", "reply", "content", "text" };
+        for (const char* k : altZh) { zhUtf8 = ExtractJsonString(jsonObj, k); if (!zhUtf8.empty()) break; }
+    }
+    if (jaUtf8.empty()) {
+        static const char* altJa[] = { "日文", "日语", "jp", "japanese" };
+        for (const char* k : altJa) { jaUtf8 = ExtractJsonString(jsonObj, k); if (!jaUtf8.empty()) break; }
+    }
+    // ★ 模型压根没输出 JSON（比如直接回了一段话），那就把这段话当正文用
     if (zhUtf8.empty() && !assistantRaw.empty() && assistantRaw.find('{') == std::string::npos)
         zhUtf8 = assistantRaw;
-    if (zhUtf8.empty())
-        zhUtf8 = "（解析回复失败，开启 PET_ENABLE_DEBUG_LOG 可在 VS 输出窗口看到原始 content）";
+
+    if (zhUtf8.empty() && !serverErr.empty()) {
+        zhUtf8 = "（接口报错：" + serverErr + "）";
+    }
+    if (zhUtf8.empty()) {
+        // ★ 失败时把模型返回的前 120 字显示在窗口里，不开日志也能一眼看出是
+        //   空内容、被截断，还是格式不对
+        std::string preview = assistantRaw.substr(0, 120);
+        for (char& c : preview) if (c == '\n' || c == '\r') c = ' ';
+        char st[32]; _snprintf_s(st, sizeof st, _TRUNCATE, "HTTP %d", httpStatus);
+        zhUtf8 = "（解析回复失败：没取到 zh 字段。" + std::string(httpStatus ? st : "HTTP 状态未知")
+            + "。响应前 120 字 → " + preview + "）";
+    }
 
     std::wstring zhReply = Utf8ToWideString(zhUtf8);
     std::wstring jaReply = Utf8ToWideString(jaUtf8);
@@ -3433,8 +3550,11 @@ static LRESULT CALLBACK ChatWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             int len = GetWindowTextLengthW(g_hHistoryEdit);
             std::wstring currentText(len, L'\0');
             GetWindowTextW(g_hHistoryEdit, &currentText[0], len + 1);
+            // 只认紧跟在换行后的标签：用户正文里也可能出现"茉子："三个字，
+            // 单纯 rfind(L"茉子：") 会把历史从用户那句话中间截断。
             size_t pos = currentText.rfind(L"茉子：");
-            if (pos != std::wstring::npos) {
+            if (pos != std::wstring::npos && pos > 0 &&
+                (currentText[pos - 1] == L'\n' || currentText[pos - 1] == L'\r')) {
                 currentText.erase(pos + 3);
                 SetWindowTextW(g_hHistoryEdit, currentText.c_str());
             }
@@ -3457,13 +3577,14 @@ static LRESULT CALLBACK ChatWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             std::wstring currentText(len, L'\0');
             GetWindowTextW(g_hHistoryEdit, &currentText[0], len + 1);
             size_t thinkPos = currentText.rfind(L"思考中...");
-            if (thinkPos != std::wstring::npos) {
+            if (thinkPos != std::wstring::npos && thinkPos >= 3) {
                 currentText.erase(thinkPos - 3, currentText.length() - (thinkPos - 3));
                 currentText += L"（未收到回复）";
                 SetWindowTextW(g_hHistoryEdit, currentText.c_str());
             }
             size_t pos = currentText.rfind(L"主人：");
-            if (pos != std::wstring::npos) {
+            if (pos != std::wstring::npos && pos > 0 &&
+                (currentText[pos - 1] == L'\n' || currentText[pos - 1] == L'\r')) {
                 size_t endPos = currentText.find(L"\r\n\r\n茉子：", pos);
                 if (endPos != std::wstring::npos) {
                     std::wstring userInput = currentText.substr(pos + 3, endPos - pos - 3);
@@ -3509,7 +3630,8 @@ static LRESULT CALLBACK ChatWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         break;
     case WM_APP_AFFINITY:
         // 兜底：这条消息由主窗口处理。万一被发到聊天窗口，转发过去而不是丢掉。
-        if (g_hwnd && IsWindow(g_hwnd)) SendMessageW(g_hwnd, WM_APP_AFFINITY, wParam, lParam);
+        // 必须异步：SendMessageW 会阻塞后台 LLM 线程死等主窗口消息循环
+        if (g_hwnd && IsWindow(g_hwnd)) PostMessageW(g_hwnd, WM_APP_AFFINITY, wParam, lParam);
         return 0;
     case WM_CLOSE:
         g_hChatWnd = nullptr; g_isChatting = false;
@@ -3695,17 +3817,31 @@ static bool ParseWav(const std::vector<char>& wav, WavData& out) {
                               (const uint8_t*)(wav.data() + pos + 8) + take);
             }
         }
-        pos += 8 + cs + (cs & 1);
+        // cs 来自文件头，畸形文件可能给到 0xFFFFFFxx；直接相加会让 DWORD
+        // 回绕成很小的值，循环条件重新成立 → 死循环。三处 WAV 解析都要防。
+        unsigned long long step = 8ull + cs + (cs & 1u);
+        unsigned long long next = (unsigned long long)pos + step;
+        if (next > 0xFFFFFFFFull) break;
+        pos = (DWORD)next;
     }
     if (out.sampleRate == 0 || out.channels == 0 || out.bitsPerSample == 0 || rawPcm.empty()) return false;
+    // 外部 WAV 不可信：先卡死格式上限，避免畸形头让 samples 申请到 GB 级内存。
+    if (out.sampleRate < 8000 || out.sampleRate > 384000 ||
+        out.channels < 1 || out.channels > 8 ||
+        !(out.bitsPerSample == 8 || out.bitsPerSample == 16 ||
+          out.bitsPerSample == 24 || out.bitsPerSample == 32)) return false;
+    if (rawPcm.size() > (size_t)256 * 1024 * 1024) return false;
 
     int bytesPerSample = out.bitsPerSample / 8;
     if (blockAlign == 0) blockAlign = bytesPerSample * out.channels;
     int frameSize = blockAlign;
     if (bytesPerSample <= 0 || frameSize <= 0) return false;   // 防止除零
     int numFrames = (int)(rawPcm.size() / frameSize);
+    size_t sampleCount = (size_t)numFrames * (size_t)out.channels;
+    // samples 是 int32_t：8bit 输入会放大 4 倍，必须按结果数组大小设上限。
+    if (sampleCount > (size_t)32 * 1024 * 1024) return false;
     out.numSamples = numFrames;
-    out.samples.resize((size_t)numFrames * out.channels);
+    out.samples.resize(sampleCount);
 
     auto getSample = [&](const uint8_t* p, int bps) -> int32_t {
         int32_t v = 0;
@@ -3895,7 +4031,11 @@ static bool RvcConvert(const std::wstring& wavPath, std::vector<char>& outWav) {
     //   -1 = 降 RVC_OCTAVE_SEMI 半音，0 = 原调，+1 = 升 RVC_OCTAVE_SEMI 半音
     //   （男声源配女声模型通常选 +1）。
     body += make_field("auto_pitch", "0");
-    body += make_field("octave", std::to_string(g_rvcOctave));
+    // ★ 变调未解锁时强制按原调转换。g_rvcOctave 可能来自旧存档或开发模式留下的值，
+    //   而菜单此时是灰的、用户改不动，若照发就会变成"没解锁却仍在变调"。
+    //   这里只影响本次请求，不清 g_rvcOctave，解锁后用户的选择仍然有效。
+    int octToSend = UnlockReady(UNLOCK_OCTAVE) ? g_rvcOctave : 0;
+    body += make_field("octave", std::to_string(octToSend));
     // ★ index_rate 不要给 1.0：检索权重越高，源音高偏离模型音域时越容易被
     //   最近邻拉到低八度样本上（表现就是高音掉八度）。
     //   同性转换可用 0.7 保音色；跨性别/大跨度由 bridge 自动再降到 0.3。
@@ -3904,6 +4044,16 @@ static bool RvcConvert(const std::wstring& wavPath, std::vector<char>& outWav) {
     body += make_field("separate",   "1");       // ★ 告诉 bridge 先分离人声伴奏
 
     std::string fileName = WideStringToUtf8(std::wstring(PathFindFileNameW(path.c_str())));
+    // multipart 的 filename 用双引号包住，文件名里的 " / CR / LF 会破坏协议边界。
+    // RFC 7578 建议直接替换掉这些字符，而不是转义（很多服务端不认 %22）。
+    {
+        std::string safe;
+        for (unsigned char c : fileName) {
+            if (c == '"' || c == '\r' || c == '\n') safe += '_';
+            else safe += (char)c;
+        }
+        fileName = safe;
+    }
     if (fileName.empty()) fileName = "audio.wav";
     std::string fileHead = "--" + boundary + "\r\n";
     fileHead += "Content-Disposition: form-data; name=\"audio\"; filename=\"" + fileName + "\"\r\n";
@@ -4058,10 +4208,9 @@ static unsigned __stdcall RvcWorker(void* arg) {
     LoadWavFromMemory(mixedWav, g_rvcCover);
     XSoundPlay(g_rvcCover, false);
     RvcSetStage(RvcStage::Done);
-    g_stat.coverCount += 1;         // ★ 只有成功才计数
-    StatsAddAffinity(3);            // 翻唱 +3 好感（对话才是主要来源）
-    AchCheck();
-    StatsSave();
+    // 统计、成就气泡与存档统一交回主线程：ToastShow 会创建窗口，
+    // 从工作线程调 UI 属于跨线程操作；g_stat 也不该被后台线程直接改写。
+    if (g_hwnd && IsWindow(g_hwnd)) PostMessageW(g_hwnd, WM_APP_RVC_DONE, 0, 0);
 
     // 存盘便于试听
     std::wstring outPath = src + L".rvc_mixed.wav";
@@ -4143,6 +4292,10 @@ void ShowContextMenu(HWND hwnd) {
     static bool s_opening = false;
     if (s_opening) return;      // 防重入：菜单已弹出时不再嵌套弹一次
     s_opening = true;
+    // 守卫：函数任何路径退出（含提前 return）都能自动复位，
+    // 否则一次异常之后右键菜单就再也打不开了。
+    struct OpeningGuard { bool* p; ~OpeningGuard() { *p = false; } } openingGuard{ &s_opening };
+    (void)openingGuard;   // 消除"已初始化但未引用"告警，析构本身才是目的
     POINT pt; GetCursorPos(&pt);
     HMENU menu = CreatePopupMenu();
     HMENU outfits = CreatePopupMenu();
@@ -4222,13 +4375,15 @@ void ShowContextMenu(HWND hwnd) {
         ID_RVC_PICK, lockName(UNLOCK_RVC, L"🎤 选择歌曲翻唱…").c_str());
     wchar_t octTitle[64];
     int octSemi = g_rvcOctave * RVC_OCTAVE_SEMI;
-    wsprintfW(octTitle, L"🎤 翻唱变调", octSemi);
+    // ★ 标题带当前半音数，方便确认这一次翻唱用的是哪一档
+    if (octSemi == 0) wsprintfW(octTitle, L"🎤 翻唱变调（原调）");
+    else              wsprintfW(octTitle, L"🎤 翻唱变调（当前 %+d 半音）", octSemi);
     bool octOk = rvcOk && UnlockReady(UNLOCK_OCTAVE);
     AppendMenuW(menu, MF_STRING | MF_POPUP | (octOk ? 0 : MF_DISABLED | MF_GRAYED),
         (UINT_PTR)octMenu, octOk ? octTitle : lockName(UNLOCK_OCTAVE, L"🎤 翻唱变调").c_str());
     wchar_t octDown[64], octUp[64];
-    wsprintfW(octDown, L"降调 ", -RVC_OCTAVE_SEMI);
-    wsprintfW(octUp,   L"升调 ",  RVC_OCTAVE_SEMI);
+    wsprintfW(octDown, L"降调 (%d 半音)", -RVC_OCTAVE_SEMI);
+    wsprintfW(octUp,   L"升调 (%+d 半音)", RVC_OCTAVE_SEMI);
     AppendMenuW(octMenu, MF_STRING | (g_rvcOctave == -1 ? MF_CHECKED : 0), ID_RVC_OCT_DOWN, octDown);
     AppendMenuW(octMenu, MF_STRING | (g_rvcOctave ==  0 ? MF_CHECKED : 0), ID_RVC_OCT_ZERO, L"原调 ");
     AppendMenuW(octMenu, MF_STRING | (g_rvcOctave ==  1 ? MF_CHECKED : 0), ID_RVC_OCT_UP,   octUp);
@@ -4280,7 +4435,6 @@ void ShowContextMenu(HWND hwnd) {
         }
         break;
     }
-    s_opening = false;
 }
 
 // ================= 窗口过程 =================
@@ -4310,18 +4464,31 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_TIMER:
         // RVC 状态栏倒计时：完成/失败显示 4 秒后自动消失
-        if (g_rvcStatusTimer > 0) {
-            g_rvcStatusTimer--;
-            if (g_rvcStatusTimer == 0) {
+        {
+            bool stageEnded = false;
+            {
                 std::lock_guard<std::recursive_mutex> lk(g_rvcMtx);
-                g_rvcStage = RvcStage::Idle;
-                g_rvcStatusText.clear();
-                g_rvcSourceName.clear();
-                // 状态结束，切回空闲动画
-                SwitchAnim(g_currentCostume, AnimState::Idle);
+                if (g_rvcStatusTimer > 0) {
+                    --g_rvcStatusTimer;
+                    if (g_rvcStatusTimer == 0) {
+                        g_rvcStage = RvcStage::Idle;
+                        g_rvcStatusText.clear();
+                        g_rvcSourceName.clear();
+                        stageEnded = true;
+                    }
+                }
             }
+            if (stageEnded) SwitchAnim(g_currentCostume, AnimState::Idle);
         }
         if (wp == 1) {
+            {   // 休眠跨零点不会重启程序，只在 WinMain 检查一次跨天是不够的
+                static ULONGLONG s_lastDayCheckMs = 0;
+                ULONGLONG dayNow = GetTickCount64();
+                if (s_lastDayCheckMs == 0 || dayNow - s_lastDayCheckMs >= 60000) {
+                    s_lastDayCheckMs = dayNow;
+                    StatsCheckDay();
+                }
+            }
             if (!g_preloadDone) {          // 加载期只推进加载动画，不碰帧数据
                 ++g_loadTick;
                 UpdateLayered();
@@ -4419,6 +4586,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_hAchPanel && IsWindow(g_hAchPanel)) InvalidateRect(g_hAchPanel, nullptr, FALSE);
         return 0;
     }
+    case WM_APP_RVC_DONE: {
+        {
+            std::lock_guard<std::recursive_mutex> lk(g_statMtx);
+            g_stat.coverCount += 1;      // 只有转换成功才计数
+            StatsAddAffinity(3);         // 翻唱 +3 好感（对话才是主要来源）
+        }
+        AchCheck();
+        StatsSave();
+        if (g_hAchPanel && IsWindow(g_hAchPanel)) InvalidateRect(g_hAchPanel, nullptr, FALSE);
+        return 0;
+    }
     case WM_APP_PRELOAD_DONE:
         SwitchAnim(g_currentCostume, AnimState::Idle);
         // ★ 一套素材都没解出来：多半是没放 Animations。
@@ -4513,6 +4691,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         RenderCacheInvalidate();   // ★ 必须在 GdiplusShutdown 之前释放 GDI+ 对象
         AnimLoadStop();            // 先停解码线程，再动缓存
         ClearFrameCache();
+        {   // 缩放重建时推迟回收的旧帧，退出前必须释放，且在 GdiplusShutdown 之前
+            std::lock_guard<std::recursive_mutex> lk(g_frameMtx);
+            ClearFrames(g_pendingDelete);
+        }
         StatsSave();                 // 累计数据落盘
         ToastDestroy();
         if (g_pTransitionImg) { delete g_pTransitionImg; g_pTransitionImg = nullptr; }
