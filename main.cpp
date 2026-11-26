@@ -36,6 +36,7 @@
 #include <cstdlib>
 #include <queue>
 #include <deque>
+#include <map>
 #include <mutex>
 #include <condition_variable>
 #include <xaudio2.h>
@@ -86,6 +87,7 @@ using namespace Gdiplus;
 static std::wstring GetLLMConfig(const wchar_t* key);
 static double GetLLMConfigDouble(const wchar_t* key, double defVal, double lo, double hi);
 static int GetLLMConfigInt(const wchar_t* key, int defVal, int lo, int hi);
+static int GetIniInt(const wchar_t* sec, const wchar_t* key, int defVal, int lo, int hi);
 static void SetIniStr(const wchar_t* sec, const wchar_t* key, const wchar_t* val);
 static std::string WideStringToUtf8(const std::wstring& wstr);
 static std::wstring Utf8ToWideString(const std::string& str);
@@ -158,6 +160,7 @@ static bool g_halfBody = false;
 #define WM_APP_PROACTIVE    (WM_APP + 5)   // 主动搭话：lParam = new std::wstring（要说的话），主线程弹气泡
 #define WM_APP_DIRECTOR     (WM_APP + 6)   // 导演指令：lParam = new L2dDirectorCmd（情绪/强度/动作/视线），主线程用完 delete
 #define WM_APP_TOUCH_REPLY  (WM_APP + 7)   // ★触摸互动：LLM 对"主人摸了某部位"的回应，lParam = new std::wstring，主线程弹气泡
+#define WM_APP_ATTACH_READY (WM_APP + 8)   // ★附件：后台解析完成，主线程回填占位附件（无 lParam，结果在全局队列）
 // 导演视线模式（放在 USE_LIVE2D 块外，供 ParseDirectorGaze 在非 Live2D 编译单元也能用）
 enum L2dGazeMode { L2D_GAZE_FOLLOW = 0, L2D_GAZE_AT_USER = 1, L2D_GAZE_AWAY = 2, L2D_GAZE_DOWN = 3 };
 #define AFFINITY_MSG_BIAS   16
@@ -1126,6 +1129,7 @@ struct L2dDirectorCmd {
     int        action    = -1;    // 动作槽覆盖：-1=不覆盖，0=待机,1=思考,2=开心
     int        gaze      = -1;    // 视线覆盖：-1=不覆盖，见 L2dGazeMode
     int        gazeHoldMs = 2500; // 视线保持时长
+    int        holdMs     = 0;    // 表情保持时长：0=用默认 L2D_EXPR_HOLD_MS；说话时按打字时长延长
 };
 
 // ==================================================================
@@ -1933,8 +1937,10 @@ void LoadConfig() {
     g_rvcOctave = GetPrivateProfileIntW(L"RVC", L"Octave", 0, iniPath);
     if (g_rvcOctave < -1) g_rvcOctave = -1;
     if (g_rvcOctave > 1) g_rvcOctave = 1;
-    // ★ 语音朗读开关：[TTS] TtsEnable，默认开。菜单里改过就记住，下次启动沿用。
-    g_ttsVoiceOn.store(GetPrivateProfileIntW(L"TTS", L"TtsEnable", 1, iniPath) != 0);
+    // ★ 语音朗读开关：llm.ini 的 [TTS] TtsEnable，默认开。
+    //   以前这里读的是 config.ini，而菜单/设置面板写的是 llm.ini ——
+    //   两个文件各存一份，重启后开关总是回到默认值。
+    g_ttsVoiceOn.store(GetIniInt(L"TTS", L"TtsEnable", 1, 0, 1) != 0);
     // 半身状态不再存开关：由窗口最后停留的位置推导，WinMain 在尺寸定下来后刷新。
     g_halfBody = false;
     {
@@ -2630,6 +2636,12 @@ static void ToastStart(int bit) {
 
 // 由主窗口 WM_TIMER 每帧推进（30fps）
 // 气泡队列：空闲时按序出队（高优先级 front 先展示），逐条不再互相盖掉。
+// 一条气泡的存在时长（毫秒）：淡入 8 帧 + 停留 3 秒 + 淡出 8 帧。
+// 表情保持时长按它来算，气泡还没消失脸就先回中性会很出戏。
+static int ToastVisibleMs() {
+    return (8 + FPS * 3 + 8) * FRAME_INTERVAL_MS;
+}
+
 static void ToastTick() {
     if (g_toastBit < 0) {
         if (!g_toastItems.empty()) { ToastItemPop(); return; }
@@ -4203,24 +4215,283 @@ std::wstring g_ttsRefAudioPath; // 全局变量，用来存运行时的绝对路
 //   如果你的参考音频说的不是这句，请在 llm.ini 的 [TTS] TtsRefText 里改成完全一致的内容。
 static const wchar_t* TTS_REF_TEXT = L"常陸茉子です、よろしくお願いします";
 
+// ==================================================================
+//  llm.ini 读写引擎：UTF-8 + 内存缓存
+// ------------------------------------------------------------------
+//  为什么不再用 Get/WritePrivateProfileStringW：
+//   1) 它们按系统 ANSI 码页解析文件。llm.ini 是 UTF-8（中文注释 + 中日文值），
+//      系统 API 读到的是乱码；写回时还会把整份文件按 ANSI 重新编码，把中文值改坏
+//      （TtsRefText 就是这样变成一长串替换字符的）。
+//   2) 每次读取都要重新解析整个文件，而一轮对话会读几十项配置。
+//   3) 单值上限 32KB，TtsExtraJson 这类长值有被静默截断的风险。
+//  这里的做法：整文件按 UTF-8 解码（识别 BOM；个别非法行按系统码页兜底，
+//  能救回旧版写进去的 GBK 值）→ 解析成 (段, 键) 索引 → 缓存，
+//  只有文件时间戳/大小变了才重新解析；写回按行精确替换，
+//  注释、顺序、行尾风格原样保留，并先写临时文件再原子替换，断电不会写坏原文件。
+// ==================================================================
+struct IniFileCache {
+    std::wstring path;
+    ULONGLONG    stamp = 0;      // 最后写入时间（FILETIME 合并成 64 位）
+    ULONGLONG    size = 0;
+    bool         valid = false;
+    bool         hasBom = false;
+    bool         crlf = true;
+    std::wstring text;                                  // 全文（UTF-16）
+    std::map<std::wstring, std::wstring> kv;            // "SECTION\x1fKEY" -> 值
+};
+static std::mutex g_iniMtx;                             // LLM 线程也会读配置
+static std::vector<IniFileCache> g_iniCache;
+
+static std::wstring IniUpper(std::wstring s) {
+    for (wchar_t& c : s) if (c >= L'a' && c <= L'z') c = (wchar_t)(c - 32);   // 键名只有 ASCII
+    return s;
+}
+static std::wstring IniTrim(const std::wstring& s) {
+    size_t a = 0, b = s.size();
+    while (a < b && (s[a] == L' ' || s[a] == L'\t')) ++a;
+    while (b > a && (s[b - 1] == L' ' || s[b - 1] == L'\t')) --b;
+    return s.substr(a, b - a);
+}
+
+static bool IniReadRaw(const std::wstring& path, std::string& out) {
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER sz{};
+    if (!GetFileSizeEx(h, &sz) || sz.QuadPart < 0 || sz.QuadPart > 8ll * 1024 * 1024) {
+        CloseHandle(h);
+        return false;
+    }
+    out.resize((size_t)sz.QuadPart);
+    DWORD got = 0;
+    bool ok = out.empty() ||
+        (ReadFile(h, &out[0], (DWORD)out.size(), &got, nullptr) && got == (DWORD)out.size());
+    CloseHandle(h);
+    return ok;
+}
+
+static bool IniUtf8ToWide(const char* p, int n, std::wstring& out) {
+    out.clear();
+    if (n <= 0) return true;
+    int need = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, p, n, nullptr, 0);
+    if (need <= 0) return false;
+    out.resize((size_t)need);
+    return MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, p, n, &out[0], need) == need;
+}
+
+// 整份按 UTF-8 解；失败说明混进了非 UTF-8 行（旧版写下的 GBK 值），逐行兜底。
+static std::wstring IniDecode(const std::string& raw, bool& hasBom) {
+    hasBom = false;
+    const char* p = raw.data();
+    size_t n = raw.size();
+    if (n >= 3 && (unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB && (unsigned char)p[2] == 0xBF) {
+        hasBom = true;
+        p += 3;
+        n -= 3;
+    }
+    std::wstring all;
+    if (IniUtf8ToWide(p, (int)n, all)) return all;
+    std::wstring out;
+    size_t i = 0;
+    while (i <= n) {
+        size_t j = i;
+        while (j < n && p[j] != '\n') ++j;
+        std::wstring line;
+        if (!IniUtf8ToWide(p + i, (int)(j - i), line)) {
+            int need = MultiByteToWideChar(CP_ACP, 0, p + i, (int)(j - i), nullptr, 0);
+            if (need > 0) {
+                line.assign((size_t)need, L'\0');
+                MultiByteToWideChar(CP_ACP, 0, p + i, (int)(j - i), &line[0], need);
+            }
+        }
+        out += line;
+        if (j >= n) break;
+        out += L'\n';
+        i = j + 1;
+    }
+    return out;
+}
+
+static std::string IniEncode(const std::wstring& text, bool withBom) {
+    std::string out;
+    if (!text.empty()) {
+        int need = WideCharToMultiByte(CP_UTF8, 0, text.c_str(), (int)text.size(), nullptr, 0, nullptr, nullptr);
+        if (need > 0) {
+            out.resize((size_t)need);
+            WideCharToMultiByte(CP_UTF8, 0, text.c_str(), (int)text.size(), &out[0], need, nullptr, nullptr);
+        }
+    }
+    if (withBom) out.insert(0, "\xEF\xBB\xBF", 3);   // UTF-8 BOM：原文件有就保留
+    return out;
+}
+
+static void IniParse(IniFileCache& c) {
+    c.kv.clear();
+    std::wstring sec;
+    size_t i = 0;
+    while (i < c.text.size()) {
+        size_t j = c.text.find(L'\n', i);
+        if (j == std::wstring::npos) j = c.text.size();
+        std::wstring line = c.text.substr(i, j - i);
+        i = (j < c.text.size()) ? j + 1 : c.text.size();
+        if (!line.empty() && line.back() == L'\r') line.pop_back();
+        std::wstring t = IniTrim(line);
+        if (t.empty() || t[0] == L';' || t[0] == L'#') continue;   // 注释整行才算，值里的分号不动
+        if (t[0] == L'[') {
+            size_t e = t.find(L']');
+            if (e != std::wstring::npos) sec = IniUpper(IniTrim(t.substr(1, e - 1)));
+            continue;
+        }
+        size_t eq = t.find(L'=');
+        if (eq == std::wstring::npos) continue;
+        std::wstring key = IniUpper(IniTrim(t.substr(0, eq)));
+        std::wstring val = IniTrim(t.substr(eq + 1));
+        if (val.size() >= 2 && val.front() == L'"' && val.back() == L'"')
+            val = val.substr(1, val.size() - 2);                 // 和系统 API 一致：去掉成对引号
+        std::wstring full = sec + L'\x1f' + key;
+        if (c.kv.find(full) == c.kv.end()) c.kv[full] = val;      // 首次出现优先
+    }
+}
+
+// 取（必要时重新解析）缓存项，调用方必须持有 g_iniMtx
+static IniFileCache* IniAcquire(const std::wstring& path) {
+    ULONGLONG stamp = 0, size = 0;
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fad)) {
+        stamp = ((ULONGLONG)fad.ftLastWriteTime.dwHighDateTime << 32) | fad.ftLastWriteTime.dwLowDateTime;
+        size = ((ULONGLONG)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
+    }
+    IniFileCache* c = nullptr;
+    for (auto& it : g_iniCache)
+        if (_wcsicmp(it.path.c_str(), path.c_str()) == 0) { c = &it; break; }
+    if (!c) { g_iniCache.push_back(IniFileCache()); c = &g_iniCache.back(); c->path = path; }
+    if (c->valid && c->stamp == stamp && c->size == size) return c;    // 文件没动，命中缓存
+    c->valid = true;
+    c->stamp = stamp;
+    c->size = size;
+    std::string raw;
+    if (!IniReadRaw(path, raw)) {                                     // 文件不存在/读不到
+        c->text.clear();
+        c->kv.clear();
+        c->hasBom = false;
+        return c;
+    }
+    c->text = IniDecode(raw, c->hasBom);
+    c->crlf = (c->text.find(L"\r\n") != std::wstring::npos);
+    IniParse(*c);
+    return c;
+}
+
+static bool IniGetValue(const std::wstring& path, const wchar_t* sec, const wchar_t* key, std::wstring& out) {
+    if (!sec || !key) return false;
+    std::lock_guard<std::mutex> lk(g_iniMtx);
+    IniFileCache* c = IniAcquire(path);
+    auto it = c->kv.find(IniUpper(sec) + L'\x1f' + IniUpper(key));
+    if (it == c->kv.end()) return false;
+    out = it->second;
+    return true;
+}
+
+static bool IniWriteRaw(const std::wstring& path, const std::string& bytes) {
+    std::wstring tmp = path + L".tmp";
+    HANDLE h = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD wrote = 0;
+    bool ok = bytes.empty() ||
+        (WriteFile(h, bytes.data(), (DWORD)bytes.size(), &wrote, nullptr) && wrote == (DWORD)bytes.size());
+    CloseHandle(h);
+    if (!ok || !MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileW(tmp.c_str());
+        return false;
+    }
+    return true;
+}
+
+static bool IniSetValue(const std::wstring& path, const wchar_t* secW, const wchar_t* keyW, const std::wstring& val) {
+    if (!secW || !keyW) return false;
+    const std::wstring sec = IniUpper(IniTrim(secW));
+    const std::wstring key = IniUpper(IniTrim(keyW));
+    std::lock_guard<std::mutex> lk(g_iniMtx);
+    IniFileCache* c = IniAcquire(path);
+
+    const bool tailNl = !c->text.empty() && c->text.back() == L'\n';
+    std::vector<std::wstring> lines;
+    for (size_t i = 0; i < c->text.size();) {
+        size_t j = c->text.find(L'\n', i);
+        if (j == std::wstring::npos) { lines.push_back(c->text.substr(i)); break; }
+        std::wstring line = c->text.substr(i, j - i);
+        if (!line.empty() && line.back() == L'\r') line.pop_back();
+        lines.push_back(line);
+        i = j + 1;
+    }
+
+    int secLine = -1, secEnd = (int)lines.size();
+    for (int i = 0; i < (int)lines.size(); ++i) {
+        std::wstring t = IniTrim(lines[i]);
+        if (t.size() < 2 || t[0] != L'[') continue;
+        size_t e = t.find(L']');
+        if (e == std::wstring::npos) continue;
+        if (secLine < 0) {
+            if (IniUpper(IniTrim(t.substr(1, e - 1))) == sec) secLine = i;
+        } else {
+            secEnd = i;                                  // 下一个段头 = 本段结束
+            break;
+        }
+    }
+
+    std::wstring keyOut = keyW;                          // 新插入时沿用调用方写的键名
+    int keyLine = -1;
+    for (int i = secLine + 1; i < secEnd && secLine >= 0; ++i) {
+        std::wstring t = IniTrim(lines[i]);
+        if (t.empty() || t[0] == L';' || t[0] == L'#') continue;
+        size_t eq = t.find(L'=');
+        if (eq == std::wstring::npos) continue;
+        if (IniUpper(IniTrim(t.substr(0, eq))) == key) { keyLine = i; break; }
+    }
+    if (keyLine >= 0) {
+        // 保留文件里原有的键名大小写，避免每次保存都把键名改成大写
+        std::wstring raw = lines[keyLine];
+        size_t eq = raw.find(L'=');
+        keyOut = IniTrim(raw.substr(0, eq));
+        lines[keyLine] = keyOut + L"=" + val;
+    } else if (secLine >= 0) {
+        lines.insert(lines.begin() + secEnd, keyOut + L"=" + val);
+    } else {
+        if (!lines.empty() && !IniTrim(lines.back()).empty()) lines.push_back(L"");
+        lines.push_back(L"[" + std::wstring(secW) + L"]");
+        lines.push_back(keyOut + L"=" + val);
+    }
+
+    std::wstring text;
+    for (size_t i = 0; i < lines.size(); ++i) {
+        text += lines[i];
+        if (i + 1 < lines.size() || tailNl) text += c->crlf ? L"\r\n" : L"\n";
+    }
+    if (!IniWriteRaw(path, IniEncode(text, c->hasBom))) return false;
+
+    // 写成功：同步刷新缓存（时间戳重新读，避免和外部编辑器的写入打架）
+    c->text = text;
+    IniParse(*c);
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fad)) {
+        c->stamp = ((ULONGLONG)fad.ftLastWriteTime.dwHighDateTime << 32) | fad.ftLastWriteTime.dwLowDateTime;
+        c->size = ((ULONGLONG)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
+    }
+    c->valid = true;
+    return true;
+}
+
 // ==================== TTS 配置（[TTS] 段） ====================
 // 端口/路径随 GPT-SoVITS 版本而变，写死容易"换个整合包就哑了"，全部可配。
-// 不能用 GetPrivateProfileStringW(..., nullptr, 0, ...) 先探长度：
-// 该调用在本机一律返回 0（不返回实际长度），旧实现因此把所有字符串配置都读成空，
-// 表现为 ApiUrl / ApiKey 丢失。改为"给足缓冲后再按返回值扩容"：
-// 返回值是实际写入的字符数（不含结尾 NUL）；只有 got == cap-1 才说明可能被截断。
+// 读配置统一走 IniGetValue：UTF-8 解析 + 缓存，不再受系统 ANSI 码页影响。
 static std::wstring ReadIniStringDyn(const wchar_t* sec, const wchar_t* key,
                                      const wchar_t* defVal, const std::wstring& iniPath) {
-    const wchar_t* fallback = defVal ? defVal : L"";
-    size_t cap = 256;
-    for (;;) {
-        std::vector<wchar_t> buf(cap, L'\0');
-        DWORD got = GetPrivateProfileStringW(sec, key, fallback, buf.data(), (DWORD)buf.size(), iniPath.c_str());
-        if (got == 0) return fallback;                 // 键不存在且默认值为空
-        if (got < cap - 1) return std::wstring(buf.data(), got);  // 完整读到
-        if (cap >= (1u << 20)) return std::wstring(buf.data(), got);  // 1MB 上限，防异常 ini
-        cap *= 2;
-    }
+    std::wstring v;
+    // 空值同样回落默认值：和老实现（GetPrivateProfileString 返回 0 字符即视为未配置）
+    // 保持一致，避免 TtsRefText 被写成空行后 TTS 直接哑掉。
+    if (IniGetValue(iniPath, sec, key, v) && !v.empty()) return v;
+    return defVal ? defVal : L"";
 }
 static std::wstring GetIniStr(const wchar_t* sec, const wchar_t* key, const wchar_t* defVal) {
     std::wstring exeDir;
@@ -4748,6 +5019,13 @@ static bool TtsSynth(const std::wstring& jaText, std::vector<char>* outWav,
     std::wstring refAudio  = GetIniStr(L"TTS", L"TtsRefAudio", L"");
     if (refAudio.empty()) refAudio = g_ttsRefAudioPath;
     std::wstring refText   = GetIniStr(L"TTS", L"TtsRefText", TTS_REF_TEXT);
+    // 旧版 ini 是 UTF-8/GBK 混排，某些编辑器重存后会把日文变成 U+FFFD（"锟斤拷"）。
+    // 这种文本送进 GPT-SoVITS 只会得到错误音色，直接回退到内置参考文本。
+    if (refText.find(L'\uFFFD') != std::wstring::npos
+        || refText.find(L"锟斤拷") != std::wstring::npos) {
+        TtsLog("warn", "TtsRefText 编码损坏，已回退内置参考文本");
+        refText = TTS_REF_TEXT;
+    }
     std::wstring textLang  = GetIniStr(L"TTS", L"TtsTextLang", L"ja");
     std::wstring promptLang= GetIniStr(L"TTS", L"TtsPromptLang", L"ja");
     int          split     = GetIniInt(L"TTS", L"TtsSplit", 1, 0, 1);
@@ -6125,10 +6403,13 @@ struct Attachment {
     std::string  mime;          // image/jpeg
     size_t       bytes = 0;     // 原始字节数
     bool         ok = false;    // 处理成功标记
+    bool         loading = false;   // ★后台解析中（PDF/OCR 可能要几十秒），先占位显示
+    int          id = 0;            // ★解析任务 id：后台结果按 id 回填，不依赖下标
 };
 
 static std::vector<Attachment> g_pendingAttachments;   // 仅主线程访问
 static void RefreshAttachStrip();                      // UI 层实现（附件条显隐/重绘）
+static void AttachDrainResults();                      // 后台解析结果回填 + 刷新附件条
 
 // ---------------- 基础工具 ----------------
 
@@ -6811,22 +7092,31 @@ static bool ExtractPdfText(const std::wstring& path, std::wstring& out, std::wst
     }
     CleanupTempTree(tmp);
 
-    // ★扫描件兜底：文字层几乎为空时（少于 20 个可见字符），转图走 OCR
+    // 短文字层兜底：以前"可见字符 < 20 就走 OCR，OCR 失败则整份判失败"，
+    // 会把只有一句话的正常 PDF（例如 5 个字的测试页）当成扫描件并丢掉已提取的文字。
+    // 现在 OCR 只作增强：pdftotext 已经有文字就绝不丢弃；OCR 更长才替换。
     int visible = 0;
     for (wchar_t c : out) if (!iswspace(c)) ++visible;
-    if (ok && visible >= 20) return true;
+    const bool hasText = ok && visible > 0;           // 纯空白不算"有文字"
+    if (hasText && visible >= 20) return true;        // 文字层够长，无需额外 OCR
     if (GetIniInt(L"Attach", L"OcrEnable", 1, 0, 1) == 0) {
-        err = L"PDF 没有文字层（扫描件），且「扫描件 OCR」是关闭的";
+        if (hasText) return true;                     // OCR 关着也保留已有文字
+        err = L"PDF 没有文字层，且「扫描件 OCR」是关闭的";
         return false;
     }
     std::wstring ocrText, ocrErr;
     int pages = GetIniInt(L"Attach", L"OcrMaxPages", 3, 1, 20);
     int dpi = GetIniInt(L"Attach", L"OcrDpi", 150, 72, 400);
     if (ExtractScannedPdf(path, pages, dpi, ocrText, ocrErr)) {
-        out = L"（扫描件 OCR 结果，前 " + std::to_wstring(pages) + L" 页）\n" + ocrText;
-        return true;
+        int ocrVisible = 0;
+        for (wchar_t c : ocrText) if (!iswspace(c)) ++ocrVisible;
+        if (!hasText || ocrVisible > visible) {
+            const wchar_t* label = hasText ? L"（OCR 补充结果，前 " : L"（扫描件 OCR 结果，前 ";
+            out = label + std::to_wstring(pages) + L" 页）\n" + ocrText;
+        }
+        return true;                                  // 无论 OCR 是否更好，已有文字都保留
     }
-    // 一张都没识别出来：明确报错，别把几行空白当正文塞给模型
+    if (hasText) return true;                         // OCR 失败也不能丢掉 pdftotext 的文字
     err = L"PDF 没有文字层，OCR 也失败：" + ocrErr;
     return false;
 }
@@ -6882,30 +7172,18 @@ static void SanitizeAttachmentText(std::wstring& s) {
     s.swap(out);
 }
 
-// 把本地文件变成待发送附件（按扩展名分派），失败时 err 给玩家看的原因
-static bool AddAttachmentFromPath(const std::wstring& path, std::wstring& err) {
-    int maxFiles = GetIniInt(L"Attach", L"MaxFiles", 4, 1, ATTACH_MAX_FILES);
-    if ((int)g_pendingAttachments.size() >= maxFiles) {
-        err = L"单次最多 " + std::to_wstring(maxFiles) + L" 个附件";
-        return false;
-    }
-    if (!PathFileExistsW(path.c_str())) { err = L"文件不存在：" + path; return false; }
+// 慢路径：PDF 要起外部进程 + 扫描件 OCR（最长 120 秒），docx/xlsx 要解 zip。
+// 这些必须放到后台线程，否则挂上一个大文件时整个聊天窗会僵住。
+static bool IsSlowAttachPath(const std::wstring& path) {
+    std::wstring e = LowerExt(path);
+    return e == L".pdf" || e == L".docx" || e == L".xlsx";
+}
 
-    WIN32_FILE_ATTRIBUTE_DATA fad{};
-    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fad)) {
-        err = L"读不到文件属性：" + FileNameOf(path);
-        return false;
-    }
-    if (fad.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-        err = L"暂不支持文件夹，请选择具体文件";
-        return false;
-    }
-    ULONGLONG fsize = ((ULONGLONG)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
-
-    Attachment a;
-    a.path = path;
-    a.name = FileNameOf(path);
-    a.bytes = (size_t)fsize;
+// 真正解析内容：图片编码 / 文本解码 / PDF 文本与 OCR / Office 解包。
+// 与 UI 无关（只读配置、只碰临时目录），可以在后台线程调用。
+static bool ParseAttachmentContent(Attachment& a, std::wstring& err) {
+    const std::wstring path = a.path;
+    const size_t fsize = a.bytes;
     std::wstring e = LowerExt(path);
     int maxSide = GetIniInt(L"Attach", L"ImageMaxSide", 1280, 512, 2048);
     int maxChars = GetIniInt(L"Attach", L"TextMaxChars", 12000, 1000, 40000);
@@ -6968,7 +7246,114 @@ static bool AddAttachmentFromPath(const std::wstring& path, std::wstring& err) {
 
     if (a.ok && a.kind != ATTACH_KIND_IMAGE && !a.text.empty())
         SanitizeAttachmentText(a.text);
+    return a.ok;
+}
 
+// ---------- 后台解析任务：主线程只放占位，结果用 id 回填 ----------
+struct AttachParseJob {
+    int        id = 0;
+    Attachment att;
+};
+struct AttachParseResult {
+    int         id = 0;
+    Attachment  att;
+    std::wstring err;
+};
+static std::atomic<int> g_attachIdSeq{ 0 };
+static std::mutex g_attachDoneMtx;
+static std::vector<AttachParseResult> g_attachDone;   // 后台写，主线程 drain
+
+static unsigned __stdcall AttachParseThreadProc(void* p) {
+    AttachParseJob* job = (AttachParseJob*)p;
+    AttachParseResult r;
+    r.id = job->id;
+    r.att = job->att;
+    std::wstring err;
+    if (!ParseAttachmentContent(r.att, err)) { r.err = err; r.att.ok = false; }
+    r.att.loading = false;
+    r.att.id = job->id;
+    delete job;
+    {
+        std::lock_guard<std::mutex> lk(g_attachDoneMtx);
+        g_attachDone.push_back(std::move(r));
+    }
+    // 通知主线程回填。两个窗口都不在时结果留在队列里，下次打开聊天窗再 drain。
+    HWND target = (g_hChatWnd && IsWindow(g_hChatWnd)) ? g_hChatWnd : g_hwnd;
+    if (target && IsWindow(target)) PostMessageW(target, WM_APP_ATTACH_READY, 0, 0);
+    return 0;
+}
+
+static bool AttachHasLoading() {
+    for (const Attachment& a : g_pendingAttachments) if (a.loading) return true;
+    return false;
+}
+
+// 把本地文件变成待发送附件（按扩展名分派），失败时 err 给玩家看的原因
+static bool AddAttachmentFromPath(const std::wstring& path, std::wstring& err) {
+    int maxFiles = GetIniInt(L"Attach", L"MaxFiles", 4, 1, ATTACH_MAX_FILES);
+    if ((int)g_pendingAttachments.size() >= maxFiles) {
+        err = L"单次最多 " + std::to_wstring(maxFiles) + L" 个附件";
+        return false;
+    }
+    if (!PathFileExistsW(path.c_str())) { err = L"文件不存在：" + path; return false; }
+
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fad)) {
+        err = L"读不到文件属性：" + FileNameOf(path);
+        return false;
+    }
+    if (fad.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+        err = L"暂不支持文件夹，请选择具体文件";
+        return false;
+    }
+    const ULONGLONG fsize = ((ULONGLONG)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
+    const std::wstring ext = LowerExt(path);
+    const bool isImage = IsImagePath(path);
+    const bool isText = IsTextPath(path);
+    const bool isDoc = IsSlowAttachPath(path);
+    if (!isImage && !isText && !isDoc) {
+        err = L"不支持的类型：" + (ext.empty() ? L"(无扩展名)" : ext) +
+            L"（支持 图片 / txt·md·代码 / pdf / docx / xlsx）";
+        return false;
+    }
+    // 体积先按类型挡掉，别等解析到一半才发现太大
+    if (isImage && fsize > ATTACH_IMG_MAX_BYTES) { err = L"图片超过 8MB，请先压缩"; return false; }
+    if (isText && fsize > ATTACH_TEXT_MAX_BYTES) { err = L"文本文件超过 2MB，请先拆分"; return false; }
+    if (isDoc && fsize > ATTACH_MAX_BYTES) { err = L"文件超过 20MB"; return false; }
+
+    Attachment a;
+    a.path = path;
+    a.name = FileNameOf(path);
+    a.bytes = (size_t)fsize;
+    a.kind = isImage ? ATTACH_KIND_IMAGE : ATTACH_KIND_TEXT;
+
+    if (isDoc) {
+        // 先占位：玩家马上能看到附件条上的「解析中…」，UI 线程立刻返回
+        a.loading = true;
+        a.id = ++g_attachIdSeq;
+        g_pendingAttachments.push_back(a);
+        RefreshAttachStrip();
+        AttachParseJob* job = new AttachParseJob();
+        job->id = a.id;
+        job->att = a;
+        uintptr_t th = _beginthreadex(nullptr, 0, AttachParseThreadProc, job, 0, nullptr);
+        if (!th) {
+            // 线程开不出来（句柄耗尽）：退回同步解析，宁可卡一下也别丢附件
+            delete job;
+            Attachment& back = g_pendingAttachments.back();
+            back.loading = false;
+            if (!ParseAttachmentContent(back, err)) {
+                g_pendingAttachments.pop_back();
+                RefreshAttachStrip();
+                return false;
+            }
+            RefreshAttachStrip();
+        }
+        PetDbgW((L"[ATTACH] 已加入（后台解析）：" + a.name + L"\n").c_str());
+        return true;
+    }
+
+    if (!ParseAttachmentContent(a, err)) return false;
     g_pendingAttachments.push_back(a);
     PetDbgW((L"[ATTACH] 已加入：" + a.name + L"\n").c_str());
     return true;
@@ -7586,6 +7971,21 @@ static unsigned __stdcall LLMThreadProc(void* param) {
 
     PostMessageW(hwnd, WM_REMOVE_THINKING, 0, 0);
 
+    // 情绪演出提前到"开始呈现回复"时投递：旧代码在打字机结束后才发，
+    // 玩家只在身体交互时看得到表情切换。现在先切脸，再说话/打字。
+    auto PostSpeechEmotion = [&](int holdMs) {
+        HWND emoHwnd = (g_hwnd && IsWindow(g_hwnd)) ? g_hwnd : hwnd;
+        auto* cmd = new L2dDirectorCmd();
+        cmd->emotion    = emo;
+        cmd->moodDelta  = emoMood;
+        cmd->intensity  = dirIntensity;
+        cmd->action     = directorOn ? dirAction : -1;
+        cmd->gaze       = directorOn ? dirGaze   : -1;
+        cmd->gazeHoldMs = 1800 + (int)(dirIntensity * 1800.0f);
+        cmd->holdMs     = holdMs;
+        if (!PostMessageW(emoHwnd, WM_APP_DIRECTOR, 0, (LPARAM)cmd)) delete cmd;
+    };
+
     // 历史落盘挪到 LLM 线程完成（UI 只负责显示，窗口关闭也不丢历史）。
     //   聊天/触摸两条线程都写，SaveChatHistory 内部已加 g_historyFileMtx 串行化。
     if (!proactive && !touch && !userInput.empty()) {
@@ -7602,12 +8002,16 @@ static unsigned __stdcall LLMThreadProc(void* param) {
     }
 
     if (touch) {
+        // 触摸回复：气泡弹出前先切表情；保持时长跟气泡同寿（以前传 0 = 默认 4.2s，
+        // 长回复会"脸先回去、文字还在"，短回复则白白多留一会儿）。
+        PostSpeechEmotion(ToastVisibleMs() + 400);
         // 触摸回复呈现统一：走"回复呈现层"——聊天窗打开就进窗口，
         //   未打开时按 TouchReplyMode 决定弹贴角色轻气泡或自动开窗口。
         HWND mainHwnd = (g_hwnd && IsWindow(g_hwnd)) ? g_hwnd : hwnd;
         auto* bubble = new std::wstring(zhReply);
         if (!PostMessageW(mainHwnd, WM_APP_TOUCH_REPLY, (WPARAM)emo, (LPARAM)bubble)) delete bubble;
     } else if (proactive) {
+        PostSpeechEmotion(ToastVisibleMs() + 400);   // 主动搭话：表情跟气泡一起收
         // 主动搭话：不走聊天窗口打字机，直接把这句话发到主窗口弹气泡。
         //   用 WM_APP_PROACTIVE，lParam = new std::wstring(要显示的话)，主线程负责释放。
         HWND mainHwnd = (g_hwnd && IsWindow(g_hwnd)) ? g_hwnd : hwnd;
@@ -7616,6 +8020,17 @@ static unsigned __stdcall LLMThreadProc(void* param) {
     } else {
         // ★ 打字机自适应：长回复自动加速并批量送出，1500 字不再要等 45 秒
         TypewriterPlan tp = PlanTypewriter(zhReply.size());
+        // 表情覆盖整段打字过程，再留 1.5 秒尾巴给 TTS 起声；避免长回复打到一半脸就回去了。
+        int speechMs = 0;
+        if (tp.charsPerTick > 0) {
+            int ticks = ((int)zhReply.size() + tp.charsPerTick - 1) / tp.charsPerTick;
+            speechMs = ticks * tp.delayMs;
+        }
+        if (speechMs < (int)L2D_EXPR_HOLD_MS) speechMs = (int)L2D_EXPR_HOLD_MS;
+        else speechMs += 1500;
+        if (speechMs > 120000) speechMs = 120000;
+        PostSpeechEmotion(speechMs);   // 打字开始前就切表情
+
         g_typewriterSkip.store(false);        // 新一轮开始，清跳过信号
         for (size_t i = 0; i < zhReply.size();) {
             if (!IsWindow(hwnd)) break;
@@ -7649,20 +8064,8 @@ static unsigned __stdcall LLMThreadProc(void* param) {
     if (!proactive)
         PostMessageW(affHwnd, WM_APP_AFFINITY, (WPARAM)(affDelta + AFFINITY_MSG_BIAS), 0);
 
-    // 导演反馈：发到主窗口，一次性驱动 动作/表情/视线/音效/心情。
-    //   lParam = new L2dDirectorCmd，主线程用完 delete（PostMessage 失败要自己回收）。
-    {
-        HWND emoHwnd = (g_hwnd && IsWindow(g_hwnd)) ? g_hwnd : hwnd;
-        auto* cmd = new L2dDirectorCmd();
-        cmd->emotion    = emo;
-        cmd->moodDelta  = emoMood;
-        cmd->intensity  = dirIntensity;
-        cmd->action     = directorOn ? dirAction : -1;
-        cmd->gaze       = directorOn ? dirGaze   : -1;
-        // 强度越高，视线演出保持越久（纯演出参数，不影响任何语言/口吻）
-        cmd->gazeHoldMs = 1800 + (int)(dirIntensity * 1800.0f);  // 1.8s ~ 3.6s
-        if (!PostMessageW(emoHwnd, WM_APP_DIRECTOR, 0, (LPARAM)cmd)) delete cmd;
-    }
+    // 导演反馈已在各呈现分支的开头通过 PostSpeechEmotion 提前投递：
+    // 表情/动作必须跟着"说话"走，而不是等整句打完才切。
 
     // ★ TTS 放在"聊天结束"之后再跑：就算合成慢或卡住，也不会把界面卡在"正在思考"。
     //   超长文本默认跳过（合成要等很久），上限默认 600 字，可在 [TTS] TtsMaxChars 调整。
@@ -7797,6 +8200,40 @@ static void RefreshAttachStrip() {
     if (g_hChatWnd && IsWindow(g_hChatWnd)) LayoutChatChildren(g_hChatWnd);
 }
 
+// 后台解析完成回填：按 id 找占位项，成功替换、失败删除并把原因显示在状态栏。
+// 玩家在解析期间手动点 ✕ 移除的条目，这里自然找不到，结果直接丢弃。
+static void AttachDrainResults() {
+    std::vector<AttachParseResult> done;
+    {
+        std::lock_guard<std::mutex> lk(g_attachDoneMtx);
+        done.swap(g_attachDone);
+    }
+    if (done.empty()) return;
+    std::wstring firstErr;
+    int okCount = 0;
+    for (AttachParseResult& r : done) {
+        int idx = -1;
+        for (size_t i = 0; i < g_pendingAttachments.size(); ++i)
+            if (g_pendingAttachments[i].id == r.id) { idx = (int)i; break; }
+        if (idx < 0) continue;
+        if (r.att.ok) {
+            g_pendingAttachments[idx] = r.att;
+            ++okCount;
+        } else {
+            g_pendingAttachments.erase(g_pendingAttachments.begin() + idx);
+            if (firstErr.empty()) firstErr = r.err.empty() ? L"附件解析失败" : r.err;
+        }
+    }
+    RefreshAttachStrip();
+    if (g_hChatWnd && IsWindow(g_hChatWnd)) {
+        if (!firstErr.empty()) ChatSetStatus(g_hChatWnd, L"⚠ " + firstErr);
+        else if (okCount > 0 && !AttachHasLoading())
+            ChatSetStatus(g_hChatWnd, L"附件已就绪，按 Enter 发送");
+    } else if (!firstErr.empty()) {
+        ToastShow(L"⚠", L"附件解析失败", firstErr.c_str());
+    }
+}
+
 static void RemoveAttachmentAt(int idx) {
     if (idx < 0 || idx >= (int)g_pendingAttachments.size()) return;
     g_pendingAttachments.erase(g_pendingAttachments.begin() + idx);
@@ -7882,9 +8319,16 @@ static LRESULT CALLBACK AttachStripProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
                 }
 
                 RECT nameRc = { chip.left + 46, chip.top + 2, chip.right - 26, chip.top + 38 };
-                std::wstring nm = g_pendingAttachments[i].name;
+                const Attachment& ai = g_pendingAttachments[i];
+                std::wstring nm = ai.name;
+                if (ai.loading) {
+                    // 解析中：名字后面挂状态、整体转灰，玩家一眼能看出"还没好"
+                    nm += L" · 解析中…";
+                    SetTextColor(hdc, dark ? RGB(150, 150, 165) : RGB(130, 130, 140));
+                }
                 DrawTextW(hdc, nm.c_str(), -1, &nameRc,
                     DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+                SetTextColor(hdc, fg);
 
                 RECT closeRc = { chip.right - 24, chip.top + 2, chip.right - 4, chip.top + 38 };
                 g_attachCloseRects.push_back(closeRc);
@@ -8060,6 +8504,18 @@ static bool AddClipboardImageAttachment(const void* dib, size_t bytes, std::wstr
     return true;
 }
 
+// 取拖放/剪贴板里的完整路径：固定 MAX_PATH*2 缓冲会截断超长路径，
+// 先问实际长度再分配，避免深层目录/长文件名被静默截断。
+static std::wstring DragFilePath(HDROP hd, UINT index) {
+    UINT len = DragQueryFileW(hd, index, nullptr, 0);
+    if (len == 0) return L"";
+    std::wstring path((size_t)len + 1, L'\0');
+    UINT got = DragQueryFileW(hd, index, path.data(), len + 1);
+    if (got == 0) return L"";
+    path.resize(got);
+    return path;
+}
+
 // Ctrl+V / 右键粘贴：优先按"文件"处理，其次按"图片"处理
 static bool AttachFromClipboard(HWND owner, std::wstring& err) {
     if (!IsClipboardFormatAvailable(CF_HDROP) && !IsClipboardFormatAvailable(CF_DIB))
@@ -8071,8 +8527,8 @@ static bool AttachFromClipboard(HWND owner, std::wstring& err) {
         if (hd) {
             UINT n = DragQueryFileW(hd, 0xFFFFFFFF, nullptr, 0);
             for (UINT i = 0; i < n; ++i) {
-                wchar_t path[MAX_PATH * 2] = { 0 };
-                if (!DragQueryFileW(hd, i, path, MAX_PATH * 2)) continue;
+                std::wstring path = DragFilePath(hd, i);
+                if (path.empty()) continue;
                 std::wstring e;
                 if (AddAttachmentFromPath(path, e)) handled = true;
                 else if (err.empty()) err = e;
@@ -8760,9 +9216,16 @@ static LRESULT CALLBACK ChatWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         //   导致第二次开聊天窗后 Enter 和 Ctrl+V 附件全部失效。每次新建都必须重挂。
         if (g_hInputEdit)
             g_oldInputProc = (WNDPROC)SetWindowLongPtrW(g_hInputEdit, GWLP_WNDPROC, (LONG_PTR)InputSubclassProc);
+        // ★附件：把上次关窗期间后台解析完的结果收掉，并按当前附件重建附件条
+        AttachDrainResults();
+        RefreshAttachStrip();
         LayoutChatChildren(hwnd);       // 首次布局：📎/🎤 + 附件条位置
         break;
     }
+    // ★附件后台解析完成：回填占位附件、刷新附件条（不进聊天状态机）
+    case WM_APP_ATTACH_READY:
+        AttachDrainResults();
+        return 0;
     case WM_SIZE: {
         // 布局集中到 LayoutChatChildren：多了附件条和 📎/🎤 两枚按钮，
         // 尺寸变化时整块重排，避免两处逻辑各改一半。
@@ -9094,8 +9557,8 @@ static LRESULT CALLBACK ChatWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         std::wstring firstErr;
         int added = 0;
         for (UINT i = 0; i < n; ++i) {
-            wchar_t path[MAX_PATH * 2] = { 0 };
-            if (!DragQueryFileW(hd, i, path, MAX_PATH * 2)) continue;
+            std::wstring path = DragFilePath(hd, i);
+            if (path.empty()) continue;
             std::wstring err;
             if (AddAttachmentFromPath(path, err)) ++added;
             else if (firstErr.empty()) firstErr = err;
@@ -9165,10 +9628,7 @@ static void SetLLMConfigInt(const wchar_t* key, int val, int lo, int hi) {
     if (val > hi) val = hi;
     std::wstring exeDir;
     if (!GetExeDir(exeDir)) return;
-    std::wstring iniPath = exeDir + L"\\llm.ini";
-    wchar_t buf[16];
-    wsprintfW(buf, L"%d", val);
-    WritePrivateProfileStringW(L"LLM", key, buf, iniPath.c_str());
+    IniSetValue(exeDir + L"\\llm.ini", L"LLM", key, std::to_wstring(val));
 }
 
 // 写回 llm.ini 的 [UI] 段（主题/打字机开关等偏好持久化）
@@ -9177,10 +9637,7 @@ static void SetUIConfigInt(const wchar_t* key, int val, int lo, int hi) {
     if (val > hi) val = hi;
     std::wstring exeDir;
     if (!GetExeDir(exeDir)) return;
-    std::wstring iniPath = exeDir + L"\\llm.ini";
-    wchar_t buf[16];
-    wsprintfW(buf, L"%d", val);
-    WritePrivateProfileStringW(L"UI", key, buf, iniPath.c_str());
+    IniSetValue(exeDir + L"\\llm.ini", L"UI", key, std::to_wstring(val));
 }
 
 static void SetButtonText(HWND hwnd, int id, const wchar_t* text) {
@@ -9344,6 +9801,14 @@ static LRESULT CALLBACK InputSubclassProc(HWND h, UINT msg, WPARAM wp, LPARAM lp
 // 共用提交入口：按钮(103) 和 回车(WM_KEYDOWN) 都走这里
 static void SubmitChat(HWND hwnd) {
     if (g_isChatting || !g_hInputEdit) return;
+    // 先把已经解析完的附件收进来；还有在后台跑的（PDF OCR）就先别发，
+    //   否则发出去的是一个空内容占位附件，模型只会回一句"没看到内容"。
+    AttachDrainResults();
+    if (AttachHasLoading()) {
+        ChatSetStatus(hwnd, L"⏳ 附件还在解析中，稍等一下再发送");
+        if (g_hInputEdit) SetFocus(g_hInputEdit);
+        return;
+    }
     // 按控件实际长度分配（上限 64KB）：固定缓冲会静默截断长消息。
     int need = GetWindowTextLengthW(g_hInputEdit);
     if (need < 0) need = 0;
@@ -10281,10 +10746,9 @@ void ShowContextMenu(HWND hwnd) {
         bool on = !g_ttsVoiceOn.load();
         g_ttsVoiceOn.store(on);
         if (!on) TtsStopAll();          // 关掉时正在念的那句也立刻停
-        wchar_t b[8]; wsprintfW(b, L"%d", on ? 1 : 0);
-        wchar_t ini[MAX_PATH]; GetModuleFileNameW(nullptr, ini, MAX_PATH); PathRemoveFileSpecW(ini);
-        wcscat_s(ini, L"\\llm.ini");
-        WritePrivateProfileStringW(L"TTS", L"TtsEnable", b, ini);
+        // 写回 llm.ini [TTS]：以前这里用 WritePrivateProfileStringW 写 UTF-8 文件，
+        // 会把同段的 TtsRefText 一起按 ANSI 重编码成乱码。
+        SetIniStr(L"TTS", L"TtsEnable", on ? L"1" : L"0");
         ToastShow(on ? L"🔊" : L"🔇", on ? L"语音朗读已开启" : L"语音朗读已关闭",
                   on ? L"回复会自动念出来。"
                      : L"只显示文字。想再打开：右键 → 语音朗读。");
@@ -10732,6 +11196,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (L2dSlotUnlocked(slot)) L2dPlayClip(slot);
             // 表情：情绪驱动（intensity 目前只留作后续强度演出的扩展位，不影响口吻）
             L2dSetExpression(emo);
+            // 说话时把表情保持到整句呈现完，而不是固定 4.2 秒就回中性脸。
+            if (cmd->holdMs > 0 && emo != PetEmotion::Base)
+                g_l2dExprUntilMs = GetTickCount64() + (ULONGLONG)cmd->holdMs;
             // 视线：导演指定则覆盖，到期自动恢复跟随鼠标（在 Live2DLookAtCursor 里处理）
             if (cmd->gaze >= 0) L2dSetGazeOverride(cmd->gaze, cmd->gazeHoldMs);
             // 音效：正向情绪用 peace，低落/思考用 think
@@ -10765,6 +11232,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             bool chatOpen = (g_hChatWnd && IsWindow(g_hChatWnd));
             if (chatOpen) {
                 AppendChatTail(reply);          // 接在"茉子："后面，并补上段尾空行
+                // 进聊天窗时没有气泡时长可参考：按字数估一段"读完这句话"的时间，
+                // 让表情陪着文字一起收，而不是字数多也 4 秒就回中性脸。
+                PetEmotion e = (PetEmotion)(int)wp;
+                if (e != PetEmotion::Base) {
+                    size_t n = reply.size() > 120 ? 120 : reply.size();
+                    int ms = 2600 + (int)n * 30;
+                    if (ms < (int)L2D_EXPR_HOLD_MS) ms = (int)L2D_EXPR_HOLD_MS;
+                    g_l2dExprUntilMs = GetTickCount64() + (ULONGLONG)ms;
+                }
             } else {
                 int mode = GetLLMConfigInt(L"TouchReplyMode", 0, 0, 2);
                 if (mode == 0 || mode == 2)     // 气泡 / 都要
@@ -10781,6 +11257,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_lastUserInputMs = GetTickCount64();   // 触摸也是一种互动，重置主动搭话静默计时
         return 0;
     }
+    // ★附件后台解析完成：聊天窗关着时消息会落到这里，同样回填 + 刷新附件条
+    //   （聊天窗下次打开会带出这些附件）
+    case WM_APP_ATTACH_READY:
+        AttachDrainResults();
+        return 0;
     // 主动搭话结果：弹气泡显示，lParam = new std::wstring，用完释放。
     case WM_APP_PROACTIVE: {
         std::wstring* text = (std::wstring*)lp;
@@ -10969,8 +11450,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         UINT n = DragQueryFileW(hd, 0xFFFFFFFF, nullptr, 0);
         std::vector<std::wstring> paths;
         for (UINT i = 0; i < n; ++i) {
-            wchar_t p[MAX_PATH * 2] = { 0 };
-            if (DragQueryFileW(hd, i, p, MAX_PATH * 2)) paths.push_back(p);
+            std::wstring p = DragFilePath(hd, i);
+            if (!p.empty()) paths.push_back(p);
         }
         DragFinish(hd);
         OpenChatDialog();
@@ -11199,12 +11680,12 @@ static HWND g_hSetCtl[SET_MAX_ROWS] = {};
 static int  g_setCurCat = 0;
 static int  g_setCurCount = 0;
 
-// 写任意段配置（GetIniStr 的对应写函数）
+// 写任意段配置（GetIniStr 的对应写函数）。走自写引擎：
+// WritePrivateProfileStringW 会按系统 ANSI 码页重写整份 UTF-8 文件，把中文值改坏。
 static void SetIniStr(const wchar_t* sec, const wchar_t* key, const wchar_t* val) {
     std::wstring dir;
     if (!GetExeDir(dir)) return;
-    std::wstring p = dir + L"\\llm.ini";
-    WritePrivateProfileStringW(sec, key, val, p.c_str());
+    IniSetValue(dir + L"\\llm.ini", sec, key, val ? val : L"");
 }
 
 // 渲染某个类别的字段控件（先销毁上一页再新建）
