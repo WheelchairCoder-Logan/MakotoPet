@@ -1,15 +1,16 @@
 # MakotoPet
 
-一个跑在 Windows 桌面上的桌宠：常陆茉子。透明分层窗口 + 序列帧动画，可以聊天、唱歌、翻唱，并带一套好感度养成与成就系统。
+一个跑在 Windows 桌面上的桌宠：常陆茉子。透明分层窗口 + Live2D 实时渲染，可以聊天、唱歌、翻唱，并带一套好感度养成与成就系统。
 
-整个客户端是 **单文件 C++（main.cpp）**，只用 Windows 系统组件，不依赖任何第三方库。
+整个客户端是 **单文件 C++（main.cpp）**，只用 Windows 系统组件。Live2D 渲染依赖一个可选的 `p2l_runtime.dll`，程序在运行时动态加载，不需要配置任何项目属性。
 
 > 这是一个个人练手项目，开源是为了记录"这个东西是怎么做出来的"。
 > 角色名、窗口类名都是本项目的固有设定，直接写在代码里，没有做成可配置的通用框架。
 
 <p align="center">
-  <img src="screenshots/pet.png" width="46%" alt="桌宠本体在桌面上的运行效果">
-  <img src="screenshots/achievements.png" width="46%" alt="好感度养成与成就面板">
+  <img src="screenshots/live2d-desktop.png" width="32%" alt="桌宠浮在桌面上的运行效果">
+  <img src="screenshots/costumes.png" width="32%" alt="忍者服 / 日常 / 校服 / 礼服四套服装">
+  <img src="screenshots/achievements.png" width="32%" alt="好感度养成与成就面板">
 </p>
 
 ---
@@ -18,7 +19,7 @@
 
 | 分类 | 说明 |
 |---|---|
-| 显示 | 分层透明窗口、序列帧动画、Ctrl+滚轮无级缩放、鼠标拖拽 |
+| 显示 | 分层透明窗口、Live2D 实时渲染（4 套服装 × 8 表情，运行时热切换）、统一人物大小、透明区鼠标穿透、序列帧回退、Ctrl+滚轮无级缩放、鼠标拖拽 |
 | 交互 | 托盘图标 + 右键菜单、点击角色随机动作、开机自启 |
 | 音频 | XAudio2 播放、音量调节、BGM 切换 |
 | 对话 | 接 OpenAI 兼容接口的大模型对话，中日双语回复 |
@@ -31,14 +32,22 @@
 
 ## 🔨 编译
 
-**环境**：Windows 10/11 + Visual Studio 2019 及以上，C++14。
+**环境**：Windows 10/11 + Visual Studio 2019 及以上（实测 VS 2026 可编译），C++14。
 
 1. 新建「Windows 桌面应用程序」空项目，把 `main.cpp` 加进去
 2. 确认链接了这些系统库（文件里已用 `#pragma comment` 声明，通常无需手动加）  
    `gdiplus.lib` `shlwapi.lib` `winmm.lib` `advapi32.lib` `xaudio2.lib` `winhttp.lib`
 3. 选 x64 / Release，编译
 
+源码以 **UTF-8 带 BOM** 保存，否则 MSVC 会把中文注释读成乱码；若编辑器去掉了 BOM，给 MSVC 加 `/utf-8`。
+
 首次启动会在 exe 同级目录生成 `config.ini`、`stats.ini`。
+
+### Live2D 运行时（可选）
+
+`p2l_runtime.dll` 不随本仓库分发。它来自 [psd2live](https://github.com/tsunehimatoi/psd2live) 的 `runtime/`（MIT）：在该目录执行 `cargo build --release`，把产物放到 exe 同级即可。程序用 `LoadLibraryW` 动态加载，**不需要** `.lib`、附加包含目录或改项目属性。
+
+把 `main.cpp` 顶部的 `USE_LIVE2D` 改成 `0` 重新编译，可完整回到旧的序列帧实现，不必准备任何 Live2D 文件。
 
 ### 开发模式
 
@@ -84,29 +93,32 @@ static const int      RVC_PORT  = 5050;
 ```
 exe 所在目录
 ├─ MakotoPet.exe
+├─ p2l_runtime.dll   ← 可选运行时（不入库，见「编译」）
 ├─ config.ini        ← 本机配置（不入库）
 ├─ llm.ini           ← 含密钥（不入库）
 ├─ prompt.txt        ← 人设提示词（不入库）
-├─ Animations\       ← 序列帧：Animations\{服装}\{动作}\*.png（不入库）
+├─ live2d\           ← Live2D 模型（不入库）
+├─ Animations\       ← 序列帧回退素材（不入库）
 ├─ AnimCache\        ← 自动生成的纹理缓存，可随时删除
 ├─ Audio\BGM.wav     ← BGM
 └─ *.wav             ← startup / exit / think / peace / costume1~3
 ```
 
-`Animations` 下按 `服装\动作` 两级组织，程序扫描目录自动识别帧数与顺序，增删图片不用改代码。
-
-四套服装 × 四个动作，目录名取自代码里的 `Costume` / `AnimState` 枚举：
+`live2d\` 按 `服装\表情` 两级组织，**每套 8 个表情各是一个独立模型**：
 
 ```
-Animations\
-├─ Ninja\  Idle\ Run\ Think\ Peace\
-├─ Daily\  ...
-├─ School\ ...
-└─ Dress\  ...
+live2d\
+├─ ninja\   base / smile / smile_sulky / panic / shy_blush / embarrassed / thinking2 / wonder  （各 .p2lrt）
+├─ daily\   同上 8 个
+├─ school\  同上 8 个
+└─ dress\   同上 8 个
 ```
 
-> 序列帧属于角色素材，不随仓库分发（见下方「关于角色素材」）。
-> 一套都没放时程序仍能启动，会在人物位置弹出提示告诉你去哪儿放图，不会白屏无响应。
+<p align="center"><img src="screenshots/live2d-folder.png" width="72%" alt="live2d 目录的实际文件列表"></p>
+
+文件名与 `Costume` 枚举一致。4 套之间可运行时热切换，情绪触发时直接切到对应表情模型，都不需要重启。
+
+`live2d\` 与 `Animations\` 都属于角色素材，不随仓库分发（见下方「关于角色素材」）。Live2D 缺素材时会自动回退序列帧；两套都没有也会正常启动并提示去哪儿放文件，不会白屏无响应。
 
 ---
 
@@ -126,7 +138,7 @@ Animations\
 
 ## ⚠️ 关于角色素材
 
-代码以 MIT 许可发布，但**角色立绘、序列帧、语音、音乐、模型不包含在本仓库中**，也不受 MIT 覆盖。
+代码以 MIT 许可发布，但**角色立绘、序列帧、`.p2lrt` 模型、语音、音乐不包含在本仓库中**，也不受 MIT 覆盖。
 
 默认角色「常陆茉子」为既有作品角色，其形象与姓名的著作权归原权利人所有。请自行确认授权范围，或替换为拥有合法权利的原创角色。详见 [NOTICE](NOTICE)。
 

@@ -4,9 +4,11 @@
 //  Licensed under the MIT License.  See LICENSE / NOTICE in the repository root.
 //
 //  这是一个个人练手项目，开源的目的是记录"这个东西是怎么做出来的"。
-//  整个客户端只有这一个 .cpp，只用 Windows 系统组件，不依赖第三方库：
+//  整个客户端只有这一个 .cpp，除可选的 Live2D 运行时外只用 Windows 系统组件：
 //
-//    · 显示   分层透明窗口 + 序列帧动画 + 磁盘纹理缓存
+//    · 显示   分层透明窗口；默认由 p2l_runtime.dll 实时渲染 live2d\ 下
+//             的 .p2lrt 模型（4 套服装运行时热切换），
+//             把 USE_LIVE2D 改成 0 则回退到序列帧动画 + 磁盘纹理缓存
 //    · 交互   托盘图标、右键菜单、拖拽、Ctrl+滚轮缩放、开机自启
 //    · 音频   XAudio2 播放 WAV，BGM / 音效 / TTS / RVC 翻唱
 //    · 对话   接 OpenAI 兼容接口，中日双语回复
@@ -24,6 +26,7 @@
 #endif
 
 #include <windows.h>
+#include <richedit.h>   // ：RichEdit 的 CHARFORMAT2W/CHARRANGE/EM_*/CFM_* 真实定义
 #include <mmsystem.h>
 #include <gdiplus.h>
 #include <shlwapi.h>
@@ -32,17 +35,39 @@
 #include <algorithm>
 #include <cstdlib>
 #include <queue>
+#include <deque>
 #include <mutex>
 #include <condition_variable>
 #include <xaudio2.h>
 #include <cstring>
 #include <winhttp.h>
+#include <objidl.h>     // ★附件：IStream / CreateStreamOnHGlobal（GDI+ 内存编码 JPEG 用）
 #include <process.h>
 #include <fstream>
 #include <atomic>
 #include <cctype>
 #include <cstdio>
+#include <cmath>
 #include <utility>
+// ★扫描件 OCR：走系统自带的 WinRT OCR（Windows.Media.Ocr），零额外下载。
+//   这些 WinRT 头会和 windows.h 的 min/max 宏打架，而本文件下面大量用 min()/max() 宏，
+//   所以只在包含这几行的期间临时取消宏，包完立刻恢复。
+#pragma push_macro("min")
+#pragma push_macro("max")
+#undef min
+#undef max
+#include <roapi.h>
+#include <winstring.h>
+#include <activation.h>
+#include <wrl/client.h>
+#include <windows.foundation.h>
+#include <windows.storage.h>
+#include <windows.storage.streams.h>
+#include <windows.graphics.imaging.h>
+#include <windows.media.ocr.h>
+#pragma pop_macro("max")
+#pragma pop_macro("min")
+#pragma comment(lib, "windowsapp.lib")   // RoGetActivationFactory / WindowsCreateString
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "winmm.lib")
@@ -52,6 +77,21 @@
 
 using namespace std;
 using namespace Gdiplus;
+
+// 全局前置声明：
+//   L2dClothTug 等在文件前部就要用配置读取函数，
+//   而这些函数的定义在文件后半部(GetLLMConfig* 约 4277 行、宽字符转换约 3634 行)。
+//   C++ 要求"先声明后使用"，这里统一前置声明。
+//   MultiByteToWideChar 来自 <windows.h>(第 28 行已包含)，无需额外声明。
+static std::wstring GetLLMConfig(const wchar_t* key);
+static double GetLLMConfigDouble(const wchar_t* key, double defVal, double lo, double hi);
+static int GetLLMConfigInt(const wchar_t* key, int defVal, int lo, int hi);
+static void SetIniStr(const wchar_t* sec, const wchar_t* key, const wchar_t* val);
+static std::string WideStringToUtf8(const std::wstring& wstr);
+static std::wstring Utf8ToWideString(const std::string& str);
+static void MarkChatGeomDirty();
+static WNDPROC g_oldInputProc;
+static LRESULT CALLBACK InputSubclassProc(HWND h, UINT msg, WPARAM wp, LPARAM lp);
 
 
 // 调试日志开关：默认 0（关闭）。
@@ -101,6 +141,12 @@ HWND g_hwnd = nullptr;
 float g_zoom = 1.0f;
 int g_currentW = BASE_W;
 int g_currentH = BASE_H;
+// 半身模式：角色仍是完整立绘，但窗口沉到屏幕底部、下半截探出屏幕外，
+// 像普通 VTuber 那样只露出上半身。不用菜单按钮：往下拖让下半身探出屏幕即可，
+// 往上拖回来恢复全身；状态直接由窗口位置推导，并随窗口坐标一起存档。
+static bool g_halfBody = false;
+#define HALF_BODY_VISIBLE     0.60f   // 半身时露在屏幕内的身高比例（其余沉到屏幕下）
+#define HALF_BODY_FULL_LIMIT  0.20f   // 探出超过这个比例就算半身（也是拖动时允许的最大"普通"探出量）
 #define FPS 30
 #define FRAME_INTERVAL_MS (1000 / FPS)
 
@@ -108,6 +154,12 @@ int g_currentH = BASE_H;
 #define WM_APP_PRELOAD_DONE (WM_APP + 1)   // 素材全量加载完成，可以显示人物了
 #define WM_APP_AFFINITY     (WM_APP + 2)   // 对话好感度增减（wParam = delta + 16，便于传负数）
 #define WM_APP_RVC_DONE     (WM_APP + 3)   // 翻唱成功，回主线程结算统计
+#define WM_APP_EMOTION      (WM_APP + 4)   // 情绪联动：wParam = PetEmotion 枚举值，主线程驱动动作/视线/音效/心情提示
+#define WM_APP_PROACTIVE    (WM_APP + 5)   // 主动搭话：lParam = new std::wstring（要说的话），主线程弹气泡
+#define WM_APP_DIRECTOR     (WM_APP + 6)   // 导演指令：lParam = new L2dDirectorCmd（情绪/强度/动作/视线），主线程用完 delete
+#define WM_APP_TOUCH_REPLY  (WM_APP + 7)   // ★触摸互动：LLM 对"主人摸了某部位"的回应，lParam = new std::wstring，主线程弹气泡
+// 导演视线模式（放在 USE_LIVE2D 块外，供 ParseDirectorGaze 在非 Live2D 编译单元也能用）
+enum L2dGazeMode { L2D_GAZE_FOLLOW = 0, L2D_GAZE_AT_USER = 1, L2D_GAZE_AWAY = 2, L2D_GAZE_DOWN = 3 };
 #define AFFINITY_MSG_BIAS   16
 #define ID_TRAY_SHOW 100
 #define ID_TRAY_AUTOSTART 101
@@ -118,8 +170,13 @@ int g_currentH = BASE_H;
 #define ID_VOLUME_MID   112
 #define ID_VOLUME_HIGH  113
 
+#define ID_RENDER_FRAMES 120        // 🖼 渲染方式：序列帧
+#define ID_RENDER_LIVE2D 121        // 🖼 渲染方式：Live2D 模型
+#define ID_TTS_TOGGLE    130        // 🔊 语音朗读开关（GPT-SoVITS）
+
 #define ID_BGM_SELECT_START 2000
 #define ID_CHAT 3000
+#define ID_SETTINGS 3001          // ⚙ 设置面板入口（右键菜单）
 #define ID_RVC_PICK 4000            // 🎤 弹出文件框，选择一首歌来翻唱
 #define ID_RVC_STATUS 4001          // 转换状态显示（不可点击，仅占位）
 #define ID_RVC_OCT_DOWN 4100        // 翻唱变调：-1 档（降 RVC_OCTAVE_SEMI 半音）
@@ -131,6 +188,16 @@ int g_currentH = BASE_H;
 
 enum class AnimState { Idle, Run, Think, Peace };
 enum class Costume { Ninja, Daily, School, Dress };
+
+// ★ 渲染方式（右键菜单可切换）：序列帧 / Live2D 模型。
+//   两套素材彼此独立，启动时各扫一次，缺哪套就把菜单里对应项灰掉，不给切。
+//   g_wantMode 是存档里选的那一项，g_renderMode 是这次实际跑起来的（可能因缺素材回落）。
+enum RenderMode { RM_FRAMES = 0, RM_LIVE2D = 1 };
+static RenderMode g_renderMode      = RM_FRAMES;
+static RenderMode g_wantMode        = RM_FRAMES;
+static bool       g_hasFrameAssets  = false;   // Animations\ 下至少有一套序列帧
+static bool       g_hasLive2DAssets = false;   // live2d\ 下有模型，且 p2l_runtime.dll 在
+static bool       g_modeFallbackNotice = false; // 启动时因缺素材回落，加载完提示一次
 
 Costume g_currentCostume = Costume::Ninja;
 AnimState g_currentState = AnimState::Idle;
@@ -146,6 +213,7 @@ bool g_hasSavedPos = false;
 bool g_bDragging = false;
 POINT g_ptLButtonDown = { 0 };
 POINT g_dragWindowStart = { 0 };
+ULONGLONG g_ptLButtonDownTick = 0;      // ★按下时刻，用来区分"点击"和"按住拖"
 
 int g_idleActionTimer = 0;
 bool g_isRandomAction = false;
@@ -166,6 +234,1162 @@ HBITMAP g_hOldBmp = nullptr;
 int     g_cachedW = 0;
 int     g_cachedH = 0;
 
+// ==================================================================
+//  ★ Live2D 渲染桥接（psd2live / p2l_runtime.dll）
+//
+//  .p2lrt 是运行时模型：每帧由运行时的软件光栅化器算出一张 RGBA8 位图，
+//  再交给已有的分层窗口贴到桌面。好感度、成就、对话、托盘等业务逻辑
+//  完全不感知渲染方式的差异。
+//
+//  这里用 LoadLibraryW 动态加载，不链接 .lib、不改 VS 项目属性：
+//  p2l_runtime.dll 放 exe 同级，4 套 .p2lrt 放其 live2d\ 子目录。
+//  缺文件时回退到序列帧渲染；换装时加载失败则保留当前这套，不白屏。
+//  把 USE_LIVE2D 改成 0 重新编译，即可完整回到旧的序列帧实现。
+// ==================================================================
+#ifndef USE_LIVE2D
+#define USE_LIVE2D 1
+#endif
+
+#include <cstdint>
+
+#if USE_LIVE2D
+#define P2L_ABI_VERSION_MAJOR 1
+#define P2L_ABI_VERSION_MINOR 4
+#define P2L_ABI_COMPATIBLE(v) (((v) >> 16) == P2L_ABI_VERSION_MAJOR && ((v) & 0xffffu) >= P2L_ABI_VERSION_MINOR)
+#define P2L_LOAD_VERIFY_CRC   1u
+#define P2L_RENDER_STRAIGHT   1u
+// 运行时内置的程序化行为位。眨眼与呼吸默认开，视线跟随默认关。
+#define P2L_BEHAVIOR_BLINK    1u
+#define P2L_BEHAVIOR_BREATH   2u
+#define P2L_BEHAVIOR_LOOK     4u
+
+struct P2lRig;   // 不透明句柄，C ABI 里只传指针
+
+struct P2lApi {
+    HMODULE dll = nullptr;
+    uint32_t    (*abi_version)(void) = nullptr;
+    void*       (*model_load)(const uint8_t*, size_t, uint32_t, char*, size_t) = nullptr;
+    void*       (*rig_create)(const void*, char*, size_t) = nullptr;
+    void        (*model_free)(void*) = nullptr;
+    void        (*rig_free)(P2lRig*) = nullptr;
+    const char* (*rig_failure)(const P2lRig*) = nullptr;
+    void        (*canvas)(const P2lRig*, float*, float*) = nullptr;
+    uint32_t    (*clip_count)(const P2lRig*) = nullptr;
+    void        (*play)(P2lRig*, int32_t) = nullptr;
+    void        (*physics_stabilize)(P2lRig*) = nullptr;
+    // ★触摸物理反馈：给指定物理组注入冲量（返回是否命中）。旧 DLL 没有此导出时为 nullptr，自动降级。
+    bool        (*physics_impulse)(P2lRig*, const char*, float, float) = nullptr;
+    // ★局部布料抓取：直接位移裙摆/裤子网格顶点并弹性回弹（返回是否命中网格）。旧 DLL 无此导出则降级。
+    bool        (*cloth_tug)(P2lRig*, const char*, float, float, float, float, float, float, float, float, float) = nullptr;
+    void        (*cloth_clear)(P2lRig*) = nullptr;
+    void        (*update)(P2lRig*, float) = nullptr;
+    bool        (*render)(P2lRig*, uint8_t*, uint32_t, uint32_t, const float*, uint32_t) = nullptr;
+    void        (*behaviors)(P2lRig*, uint32_t) = nullptr;   // 可选：旧运行时没有也不影响渲染
+    void        (*look_at)(P2lRig*, float, float) = nullptr;
+    // ★ 表情 API（可选）：旧 DLL 没有这些导出时为 nullptr，表情功能自动降级，
+    //   其余渲染/动作完全不受影响。ABI 1.4 起提供。
+    uint32_t    (*expression_count)(const P2lRig*) = nullptr;
+    const char* (*expression_id)(const P2lRig*, uint32_t) = nullptr;
+    void        (*expression)(P2lRig*, int32_t) = nullptr;
+    // ★ 多模型表情贴图 API（可选）：加载模型后告诉 DLL 用哪套烘焙表情，
+    //   切换服装时表情贴图随之切换。旧 DLL 没有这些导出时为 nullptr，自动降级。
+    void        (*face_atlas_set_model)(P2lRig*, const char*) = nullptr;
+    // ★ school8 表情系统（可选）：启用后 p2l_expression 的 0..7 对应 8 张原作差分表情，
+    //   分层眼球仍跟随光标。旧 DLL 无此导出时降级到旧 7 槽表情。
+    void        (*school8_enable)(bool) = nullptr;
+};
+
+static P2lApi               g_p2l;
+static P2lRig*              g_l2dRig = nullptr;
+
+// ★★ 32-rig 架构 ★★
+// 新模型结构：live2d/{ninja|daily|school|dress}/{base,smile,...}.p2lrt，
+// 每个表情是独立烘焙 rig。换装时把该套 8 个表情一次性预加载缓存，
+// 情绪触发时只切换 g_l2dRig 指针 —— 表情 100% 还原立绘，且切换零延迟。
+// 旧的单文件结构（live2d/{costume}.p2lrt + DLL 内嵌 atlas 表情）仍兼容：
+// 这时只有 base 一个 rig，表情继续走 g_p2l.expression() 参数化切换。
+struct L2dExprRig {
+    P2lRig* rig = nullptr;
+    bool    ok  = false;
+};
+#define L2D_EXPR_COUNT 8
+static L2dExprRig  g_l2dExprRigs[L2D_EXPR_COUNT];   // 当前服装的 8 个表情 rig
+static int         g_l2dCurExpr = 0;                // 当前表情槽位（0=base）
+// ★ 最近一次播放的动作片段槽位。-1 = 还没播过。
+//   8 个表情是 8 个独立 rig，动作片段状态不互相共享；切 rig 后必须在
+//   新 rig 上重放一次，否则"先播动作、再切表情"会把本轮动作丢掉
+//   （表现就是表情变了、身体却停在待机）。
+static int         g_l2dLastClipSlot = -1;
+static bool        g_l2dMultiRig = false;           // true=新结构(8独立rig) false=旧结构(单rig+atlas)
+// 与 live2d/{服装}/ 下的文件名严格一致
+static const char* const kL2dExprFile[L2D_EXPR_COUNT] = {
+    "base", "smile", "smile_sulky", "panic",
+    "shy_blush", "embarrassed", "thinking2", "wonder"
+};
+// ★ 运行时 DLL 是否已成功加载且 ABI 兼容。与「当前服装有没有模型」分开记：
+//   DLL 就绪但某套服装没模型时，保持 DLL 常驻，换到有模型的服装仍能用模型；
+//   这就把旧的「全局开关式降级」改成了「按服装粒度自动降级」。
+static bool                 g_l2dLibReady = false;
+static float                g_l2dCW = 0, g_l2dCH = 0;
+static std::vector<uint8_t> g_l2dRgba;      // p2l_render 的输出，复用避免每帧分配
+static bool                 g_l2dFrameDirty = true;
+static ULONGLONG            g_l2dLastMs = 0;
+// ★ 表情显示时长：到点自动淡出回中性脸，避免一个表情永久挂脸上。
+static ULONGLONG            g_l2dExprUntilMs = 0;   // 0 = 当前无表情
+#define L2D_EXPR_HOLD_MS 4200
+
+
+// ★ 当前模型是否启用 school8（8 张原作差分表情）。校服物理模型 = true。
+//   为 true 时情绪直接映射到 0..7 槽位号；为 false 时走旧的 EXPR 字符串查表（兼容旧模型）。
+static bool                 g_school8Active = false;
+
+// ---------- 统一人物大小 ----------
+// 4 套 .p2lrt 的画布尺寸和留白都不同。按 canvas 等比缩放会让换装时人物忽大忽小，
+// 所以改为按「实际不透明内容的包围盒」归一：所有服装的人物高度都映射到窗口
+// 高度的同一比例，宽度按各自原画比例，不拉伸。
+struct L2dContent {
+    float x = 0.0f, y = 0.0f, w = 0.0f, h = 0.0f;   // canvas 坐标系
+    bool  ok = false;
+};
+static L2dContent g_l2dContent;
+
+// 人物内容占窗口的比例。留 6% 给头发物理 / 裙摆摆动，免得动作一出就被裁掉。
+#define L2D_FIT_W 0.94f
+#define L2D_FIT_H 0.94f
+
+static void Live2DApplyWindowSize();   // 定义在窗口工具区（要用 g_winX / g_winY）
+// ★ 保证序列帧后台预加载线程已启动。定义在加载区，换装降级为序列帧时调用，
+//   否则若启动时因为「当前服装有模型」跳过了 AnimLoadStart，之后降级到无模型
+//   服装时帧缓存会是空的、画面全黑。此函数幂等，重复调用无副作用。
+static void AnimLoadStart();
+
+// canvas -> image 变换。校准失败时退回整块画布等比居中，不影响可用性。
+static void Live2DFrameTransform(int w, int h, float cw, float ch,
+                                 const L2dContent& c,
+                                 float& scale, float& tx, float& ty) {
+    if (c.ok && c.w > 0.0f && c.h > 0.0f && cw > 0.0f && ch > 0.0f) {
+        float sx = (float)w * L2D_FIT_W / c.w;
+        float sy = (float)h * L2D_FIT_H / c.h;
+        scale = (sx < sy) ? sx : sy;
+        tx = (float)w * 0.5f - (c.x + c.w * 0.5f) * scale;
+        ty = (float)h * 0.5f - (c.y + c.h * 0.5f) * scale;
+    } else {
+        float sx = (float)w / cw, sy = (float)h / ch;
+        scale = (sx < sy) ? sx : sy;
+        tx = ((float)w - cw * scale) * 0.5f;
+        ty = ((float)h - ch * scale) * 0.5f;
+    }
+}
+
+// 渲染一张小图，量出人物实际不透明内容的包围盒。只在载入 / 换装时跑一次。
+static bool Live2DCalibrate(P2lRig* rig, float cw, float ch, L2dContent& out) {
+    out = L2dContent{};
+    if (!rig || !g_p2l.render || !(cw > 0.0f) || !(ch > 0.0f)) return false;
+    float s = 512.0f / ((cw > ch) ? cw : ch);
+    int pw = (int)(cw * s + 0.5f), ph = (int)(ch * s + 0.5f);
+    if (pw < 8 || ph < 8 || (size_t)pw * (size_t)ph > 4u * 1024u * 1024u) return false;
+    std::vector<uint8_t> buf((size_t)pw * (size_t)ph * 4u, 0);
+    float xf[6] = { s, 0.0f, 0.0f, s, 0.0f, 0.0f };   // canvas -> 校准缓冲
+    if (!g_p2l.render(rig, buf.data(), (uint32_t)pw, (uint32_t)ph, xf, P2L_RENDER_STRAIGHT))
+        return false;
+
+    // 行列累计阈值：滤掉抗锯齿留下的零星半透明噪点，避免包围盒被撑大。
+    std::vector<int> rowHit(ph, 0), colHit(pw, 0);
+    for (int y = 0; y < ph; ++y) {
+        const uint8_t* p = buf.data() + (size_t)y * (size_t)pw * 4u;
+        for (int x = 0; x < pw; ++x, p += 4) {
+            if (p[3] >= 24) { ++rowHit[y]; ++colHit[x]; }
+        }
+    }
+    int rThr = (int)(pw * 0.004f); if (rThr < 2) rThr = 2;
+    int cThr = (int)(ph * 0.004f); if (cThr < 2) cThr = 2;
+    int minY = -1, maxY = -1, minX = -1, maxX = -1;
+    for (int y = 0; y < ph; ++y) if (rowHit[y] >= rThr) { if (minY < 0) minY = y; maxY = y; }
+    for (int x = 0; x < pw; ++x) if (colHit[x] >= cThr) { if (minX < 0) minX = x; maxX = x; }
+    if (minY < 0 || minX < 0) return false;
+    out.x = (float)minX / s; out.y = (float)minY / s;
+    out.w = (float)(maxX - minX + 1) / s; out.h = (float)(maxY - minY + 1) / s;
+    if (!(out.w >= cw * 0.02f) || !(out.h >= ch * 0.02f)) { out = L2dContent{}; return false; }
+    out.ok = true;
+    return true;
+}
+#endif
+
+static uint8_t* g_dibBits = nullptr;        // 32bpp 离屏位图的像素（仅 Live2D 路径使用）
+
+// 鼠标命中：alpha 低于此值的像素视为「空白」，让鼠标穿透到桌面。
+// 只在完全透明处生效，人物身上照常拖动 / 右键。
+// 少数系统对分层窗口的 HTTRANSPARENT 处理不同，若发现空白区点不到桌面，
+// 把 L2D_PIXEL_HITTEST 改成 0 即可回到「整个窗口都命中」的原行为。
+#define L2D_HIT_ALPHA_MIN 8
+#define L2D_PIXEL_HITTEST 1
+
+// 窗口位置工具定义在窗口工具区，桥接段要提前用，这里先声明。
+static void ClampToMonitor(POINT pt, int w, int h, int& outX, int& outY);
+static int  MonitorWorkBottom(POINT pt);
+static void RefreshHalfBodyFromPlacement(int top, int h, POINT anchor);
+static void RefreshHalfBodyFromWindow();
+static void SnapHalfBodyOnDragEnd(POINT cursor, int& outY);
+
+static bool Live2DReady() {
+#if USE_LIVE2D
+    return g_l2dRig != nullptr;
+#else
+    return false;
+#endif
+}
+
+#if USE_LIVE2D
+static void Live2DWarn(const wchar_t* what, const char* detail = nullptr) {
+    std::wstring s = L"Live2D 模型未能加载：";
+    s += what;
+    if (detail && *detail) {
+        wchar_t buf[512];
+        if (MultiByteToWideChar(CP_UTF8, 0, detail, -1, buf, 512) > 0) { s += L"\n\n"; s += buf; }
+    }
+    s += L"\n\n已回退到序列帧渲染。若要用 Live2D，请把 p2l_runtime.dll 放在 exe 同级，\n并把 ninja / daily / school / dress 的 *_physics.p2lrt（或 .p2lrt）放进同级的 live2d 文件夹。";
+    MessageBoxW(nullptr, s.c_str(), L"MakotoPet", MB_OK | MB_ICONINFORMATION);
+}
+
+// ★ 只释放当前 rig，保留运行时 DLL 与函数指针。
+//   换到「没有模型」的服装时用它把渲染切回序列帧，这样后面再换回有模型的
+//   服装还能立即重新加载，无需重开程序。与 Live2DShutdown 的区别就在是否
+//   卸载 DLL：前者是「按服装降级」，后者才是「整个运行时退出」。
+
+
+// 统一的 rig 释放入口
+// 所有权规则必须唯一且清晰，否则切换服装会崩在堆损坏上：
+//   · 新结构(g_l2dMultiRig)：8 个 rig 的拥有者是 g_l2dExprRigs 中 ok=true 的槽位；
+//     ok=false 的槽位只是指向 base 的共享别名，不单独释放；
+//     g_l2dRig 也只是一个借用指针（始终指向 8 个之一），绝不单独释放。
+//   · 旧结构：唯一的 rig 由 g_l2dRig 拥有，直接释放。
+// 所有"换装/降级/求值失败/退出"路径都必须走这里，禁止再手工 rig_free。
+static void ReleaseAllRigs() {
+    if (g_l2dMultiRig) {
+        for (int i = 0; i < L2D_EXPR_COUNT; ++i) {
+            if (g_l2dExprRigs[i].ok && g_l2dExprRigs[i].rig && g_p2l.rig_free)
+                g_p2l.rig_free(g_l2dExprRigs[i].rig);
+            g_l2dExprRigs[i].rig = nullptr;
+            g_l2dExprRigs[i].ok  = false;
+        }
+    } else {
+        if (g_l2dRig && g_p2l.rig_free) g_p2l.rig_free(g_l2dRig);
+    }
+    g_l2dRig = nullptr;
+    g_l2dCurExpr = 0;
+    g_l2dMultiRig = false;
+}
+
+static void Live2DReleaseRig() {
+    ReleaseAllRigs();   // 统一释放：新结构按 ok 去重、g_l2dRig 是别名不单独 free
+    g_l2dFrameDirty = true;
+    g_l2dLastMs = 0;
+    g_l2dRgba.clear();
+    g_l2dContent = L2dContent{};
+    g_l2dExprUntilMs = 0;
+}
+
+static void Live2DShutdown() {
+    Live2DReleaseRig();
+    if (g_p2l.dll) { FreeLibrary(g_p2l.dll); g_p2l.dll = nullptr; }
+    g_p2l = P2lApi{};
+    g_l2dLibReady = false;
+}
+
+// 4 套服装与 live2d\ 下的模型一一对应，顺序必须与 Costume 枚举一致。
+static const char* const kL2dModelName[] = { "ninja", "daily", "school", "dress" };
+static const wchar_t* const kL2dModelLabel[] = {
+    L"live2d\\ninja.p2lrt", L"live2d\\daily.p2lrt",
+    L"live2d\\school.p2lrt", L"live2d\\dress.p2lrt"
+};
+static std::wstring g_l2dLastError;    // 最近一次加载失败原因，换装失败时给气泡用
+
+// 载入一套服装的 .p2lrt。只有新模型成功出第一帧，才替换当前 rig。
+//   warnOnFail   初始化失败弹说明框；运行时换装不弹，交给托盘气泡
+//   allowLegacy  仅启动时允许回退到旧的单模型文件名；换装时不回退，
+//                否则点了「校服」却冒出别的模型，比不换更让人困惑
+// 读取一个 .p2lrt 文件到字节数组（返回大小，失败返回 0）。
+static size_t ReadP2lrt(const char* path, std::vector<uint8_t>& bytes) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) return 0;
+    std::streamoff n = f.tellg();
+    if (n <= 0 || n > 64 * 1024 * 1024) return 0;   // 硬上限，挡住畸形文件
+    f.seekg(0, std::ios::beg);
+    bytes.resize((size_t)n);
+    if (!f.read((char*)bytes.data(), n)) { bytes.clear(); return 0; }
+    return (size_t)n;
+}
+
+// 把一个 rig 初始化到可用状态（atlas / 动作 / 物理 / 行为）。每个表情 rig 都要跑一遍。
+static void InitOneRig(P2lRig* rig, int idx) {
+    if (!rig) return;
+    // ★ 新结构每个表情是独立烘焙 rig，脸已画死在贴图里，不再需要 DLL 内嵌 atlas 换脸。
+    //   但仍告诉 DLL 当前服装，防止旧 DLL 的 school8/atlas 逻辑误触发（并把 atlas 关掉）。
+    if (g_p2l.face_atlas_set_model) g_p2l.face_atlas_set_model(rig, kL2dModelName[idx]);
+    if (g_p2l.clip_count(rig) > 0) g_p2l.play(rig, 0);   // 播放第一个动作（待机）
+    g_p2l.physics_stabilize(rig);                        // 头发/裙摆先落到静止位
+    // 行为层是 per-rig 的：每个表情 rig 都要重开，否则眨眼/视线跟随静默失效。
+    if (g_p2l.behaviors) g_p2l.behaviors(rig, P2L_BEHAVIOR_BLINK | P2L_BEHAVIOR_BREATH | P2L_BEHAVIOR_LOOK);
+}
+
+static bool Live2DOpenRig(Costume c, bool warnOnFail, bool allowLegacy) {
+    int idx = (int)c;
+    if (idx < 0 || idx > 3) idx = 0;
+    g_l2dLastError.clear();
+
+    auto fail = [&](const wchar_t* what, const char* detail = nullptr) -> bool {
+        g_l2dLastError = what;
+        if (warnOnFail) Live2DWarn(what, detail);
+        return false;
+    };
+
+    // WinMain 已把当前目录设为 exe 所在目录，相对路径即 exe 同级。
+    std::string pn = kL2dModelName[idx];
+
+    // ========== 新结构：live2d/{ninja|daily|school|dress}/{表情}.p2lrt ==========
+    // 探测目录里的 base.p2lrt；存在则按 8 表情独立 rig 整套预加载。
+    std::string basePath = std::string("live2d/") + pn + "/base.p2lrt";
+    {
+        std::vector<uint8_t> probe;
+        bool hasDir = ReadP2lrt(basePath.c_str(), probe) > 0;
+        if (hasDir) {
+            L2dExprRig loaded[L2D_EXPR_COUNT];
+            int okCount = 0;
+            char err[256] = { 0 };
+            for (int e = 0; e < L2D_EXPR_COUNT; ++e) {
+                std::string path = std::string("live2d/") + pn + "/" + kL2dExprFile[e] + ".p2lrt";
+                std::vector<uint8_t> bytes;
+                if (!ReadP2lrt(path.c_str(), bytes)) {
+                    // 单个表情缺失不算致命：缺哪个就用 base 顶上，保证切换不卡住。
+                    PetDbgA("[MakotoPet] missing expr rig\n");
+                    continue;
+                }
+                err[0] = 0;
+                void* model = g_p2l.model_load(bytes.data(), bytes.size(), P2L_LOAD_VERIFY_CRC, err, sizeof err);
+                if (!model) continue;
+                P2lRig* rig = (P2lRig*)g_p2l.rig_create(model, err, sizeof err);
+                g_p2l.model_free(model);   // rig 持有模型，立即释放
+                if (!rig) continue;
+                InitOneRig(rig, idx);
+                loaded[e].rig = rig;
+                loaded[e].ok = true;
+                ++okCount;
+            }
+            if (okCount == 0 || !loaded[0].ok) {
+                // base 都没加载成功 → 整套装失败，释放已加载的
+                for (int e = 0; e < L2D_EXPR_COUNT; ++e)
+                    if (loaded[e].rig && g_p2l.rig_free) g_p2l.rig_free(loaded[e].rig);
+                return fail(L"表情模型加载失败", err);
+            }
+            // 缺失的表情用 base 克隆指针共享（释放时按 ok 标记去重）——这里直接指向 base rig，
+            // 但为避免 double free，ok=false 的槽位在释放循环里跳过，只有 base 槽负责释放。
+            for (int e = 0; e < L2D_EXPR_COUNT; ++e) {
+                if (!loaded[e].ok) { loaded[e].rig = loaded[0].rig; loaded[e].ok = false; }
+            }
+
+            P2lRig* baseRig = loaded[0].rig;
+            float cw = 0.0f, ch = 0.0f;
+            g_p2l.canvas(baseRig, &cw, &ch);
+            if (!(cw > 0.0f) || !(ch > 0.0f)) {
+                for (int e = 0; e < L2D_EXPR_COUNT; ++e)
+                    if (loaded[e].ok && g_p2l.rig_free) g_p2l.rig_free(loaded[e].rig);
+                return fail(L"模型画布尺寸无效");
+            }
+            // 校准用 base（中性脸），所有表情共用同一 content/变换，切换时不跳动。
+            L2dContent content;
+            if (!Live2DCalibrate(baseRig, cw, ch, content)) content = L2dContent{};
+
+            // 首帧：先让 base 出第一帧，成功才替换，避免闪黑。
+            const int pw = (g_currentW > 0) ? g_currentW : BASE_W;
+            const int ph = (g_currentH > 0) ? g_currentH : BASE_H;
+            std::vector<uint8_t> first((size_t)pw * (size_t)ph * 4, 0);
+            float scale = 0.0f, tx = 0.0f, ty = 0.0f;
+            Live2DFrameTransform(pw, ph, cw, ch, content, scale, tx, ty);
+            float xf[6] = { scale, 0.0f, 0.0f, scale, tx, ty };
+            bool drawn = g_p2l.render(baseRig, first.data(), (uint32_t)pw, (uint32_t)ph, xf, P2L_RENDER_STRAIGHT)
+                         && (g_p2l.rig_failure(baseRig) == nullptr);
+            if (!drawn) {
+                for (int e = 0; e < L2D_EXPR_COUNT; ++e)
+                    if (loaded[e].ok && g_p2l.rig_free) g_p2l.rig_free(loaded[e].rig);
+                return fail(L"新模型首帧渲染失败，已保留当前服装");
+            }
+
+            // 走到这里整套已验证可用，才动全局状态：先释放旧的一套（统一入口，杜绝 double free）。
+            ReleaseAllRigs();
+            for (int e = 0; e < L2D_EXPR_COUNT; ++e) g_l2dExprRigs[e] = loaded[e];
+
+            g_l2dRig = baseRig;
+            g_l2dCurExpr = 0;
+            g_l2dMultiRig = true;
+            g_l2dCW = cw; g_l2dCH = ch;
+            g_l2dContent = content;
+            g_l2dRgba.swap(first);
+            g_l2dFrameDirty = false;
+            g_l2dLastMs = 0;
+            g_l2dExprUntilMs = 0;
+            // 新结构不再用 school8 的 atlas 表情机制，关闭避免干扰。
+            g_school8Active = false;
+            if (g_p2l.school8_enable) g_p2l.school8_enable(false);
+
+            PetDbgA("[MakotoPet] multi-rig structure loaded\n");
+            Live2DApplyWindowSize();
+            return true;
+        }
+    }
+
+    // ========== 旧结构：live2d/{pn}[_physics].p2lrt 单文件 + DLL atlas 表情 ==========
+    std::string p0 = std::string("live2d/") + pn + "_physics.p2lrt";
+    std::string p1 = std::string("live2d/") + pn + ".p2lrt";
+    std::string p2 = std::string(pn) + "_physics.p2lrt";   // 也接受直接放在 exe 同级
+    std::string p3 = std::string(pn) + ".p2lrt";
+    std::vector<const char*> paths;
+    paths.push_back(p0.c_str());                 // ★ 物理模型优先
+    paths.push_back(p1.c_str());
+    paths.push_back(p2.c_str());
+    paths.push_back(p3.c_str());
+    if (allowLegacy) { paths.push_back("mako.p2lrt"); paths.push_back("tml.p2lrt"); }
+
+    std::vector<uint8_t> bytes;
+    for (const char* p : paths) {
+        if (ReadP2lrt(p, bytes) > 0) break;
+        bytes.clear();
+    }
+    if (bytes.empty()) {
+        g_l2dLastError = std::wstring(L"找不到模型 ") + kL2dModelLabel[idx];
+        if (warnOnFail) Live2DWarn(g_l2dLastError.c_str());
+        return false;
+    }
+
+    char err[256] = { 0 };
+    void* model = g_p2l.model_load(bytes.data(), bytes.size(), P2L_LOAD_VERIFY_CRC, err, sizeof err);
+    if (!model) return fail(L"模型解析失败", err);
+    P2lRig* rig = (P2lRig*)g_p2l.rig_create(model, err, sizeof err);
+    g_p2l.model_free(model);          // rig 持有模型，这里可以立即释放
+    if (!rig) return fail(L"模型无法求值", err);
+
+    // ★ 告诉定制 DLL 当前服装，随后 expression 会切到该服装的烘焙表情贴图。
+    if (g_p2l.face_atlas_set_model)
+        g_p2l.face_atlas_set_model(rig, kL2dModelName[idx]);
+
+    // 旧单文件模型走 school8 / EXPR 表情机制。
+    g_school8Active = (idx == (int)Costume::School) && (g_p2l.school8_enable != nullptr);
+    if (g_p2l.school8_enable)
+        g_p2l.school8_enable(g_school8Active);
+
+    float cw = 0.0f, ch = 0.0f;
+    g_p2l.canvas(rig, &cw, &ch);
+    if (!(cw > 0.0f) || !(ch > 0.0f)) { g_p2l.rig_free(rig); return fail(L"模型画布尺寸无效"); }
+    if (g_p2l.clip_count(rig) > 0) g_p2l.play(rig, 0);
+    g_p2l.physics_stabilize(rig);
+    if (g_p2l.behaviors)
+        g_p2l.behaviors(rig, P2L_BEHAVIOR_BLINK | P2L_BEHAVIOR_BREATH | P2L_BEHAVIOR_LOOK);
+
+    L2dContent content;
+    if (!Live2DCalibrate(rig, cw, ch, content)) content = L2dContent{};
+
+    const int pw = (g_currentW > 0) ? g_currentW : BASE_W;
+    const int ph = (g_currentH > 0) ? g_currentH : BASE_H;
+    std::vector<uint8_t> first((size_t)pw * (size_t)ph * 4, 0);
+    float scale = 0.0f, tx = 0.0f, ty = 0.0f;
+    Live2DFrameTransform(pw, ph, cw, ch, content, scale, tx, ty);
+    float xf[6] = { scale, 0.0f, 0.0f, scale, tx, ty };
+    bool drawn = g_p2l.render(rig, first.data(), (uint32_t)pw, (uint32_t)ph, xf, P2L_RENDER_STRAIGHT)
+                 && (g_p2l.rig_failure(rig) == nullptr);
+    if (!drawn) { g_p2l.rig_free(rig); return fail(L"新模型首帧渲染失败，已保留当前服装"); }
+
+    ReleaseAllRigs();   // 统一释放（也可能刚从新结构服装换过来）
+    g_l2dRig = rig;
+    g_l2dCurExpr = 0;
+    g_l2dMultiRig = false;
+    g_l2dCW = cw; g_l2dCH = ch;
+    g_l2dContent = content;
+    g_l2dRgba.swap(first);
+    g_l2dFrameDirty = false;
+    g_l2dLastMs = 0;
+    g_l2dExprUntilMs = 0;
+    Live2DApplyWindowSize();
+    return true;
+}
+
+static bool Live2DInit() {
+    g_p2l.dll = LoadLibraryW(L"p2l_runtime.dll");
+    // ★ 静默降级：没有运行时 DLL 是「纯序列帧部署」的正常情形，不弹框打断用户。
+    if (!g_p2l.dll) { PetDbgA("[MakotoPet] no p2l_runtime.dll, use frame animation\n"); return false; }
+
+    bool ok = true;
+#define P2L_GET(field) \
+    g_p2l.field = reinterpret_cast<decltype(g_p2l.field)>(GetProcAddress(g_p2l.dll, "p2l_" #field)); \
+    if (!g_p2l.field) ok = false;
+#define P2L_GET_OPT(field) \
+    g_p2l.field = reinterpret_cast<decltype(g_p2l.field)>(GetProcAddress(g_p2l.dll, "p2l_" #field));
+    P2L_GET(abi_version) P2L_GET(model_load) P2L_GET(rig_create) P2L_GET(model_free)
+    P2L_GET(rig_free)    P2L_GET(rig_failure) P2L_GET(canvas)     P2L_GET(clip_count)
+    P2L_GET(play)        P2L_GET(physics_stabilize) P2L_GET(update) P2L_GET(render)
+    // 视线跟随是增量玩法：缺这两个导出时只是不跟随，不让整个 Live2D 回退。
+    P2L_GET_OPT(behaviors) P2L_GET_OPT(look_at)
+    // ★触摸物理反馈：可选导出，缺了只是没有裙摆冲量，不影响其余功能。
+    P2L_GET_OPT(physics_impulse)
+    // ★局部布料抓取：可选导出，缺了退回旧的物理冲量方案。
+    P2L_GET_OPT(cloth_tug) P2L_GET_OPT(cloth_clear)
+    // ★ 表情 API（可选）：缺任一导出时 g_p2l.expression 置空，表情功能降级为无，
+    //   不影响其余功能。要求的三个必须同时存在才启用。
+    P2L_GET_OPT(expression_count) P2L_GET_OPT(expression_id) P2L_GET_OPT(expression)
+    if (!(g_p2l.expression_count && g_p2l.expression_id && g_p2l.expression))
+        g_p2l.expression = nullptr;   // 三缺一就整体关闭，避免半套调用
+    // ★ 多模型表情贴图：缺导出时不报错，只是表情贴图不随服装切换（降级为 ninja 贴图）。
+    P2L_GET_OPT(face_atlas_set_model)
+    // ★ school8 表情系统：缺导出时降级到旧表情贴图。
+    P2L_GET_OPT(school8_enable)
+#undef P2L_GET_OPT
+#undef P2L_GET
+    // 接口缺失 / ABI 不兼容：运行时本身不可用，才真正卸载并走序列帧。
+    // 这里仍不弹框（用户要的是「自动降级」），只写调试日志。
+    if (!ok) { PetDbgA("[MakotoPet] p2l_runtime.dll too old, use frame animation\n"); Live2DShutdown(); return false; }
+
+    uint32_t abi = g_p2l.abi_version();
+    if (!P2L_ABI_COMPATIBLE(abi)) {
+        char dbg[160];
+        sprintf_s(dbg, sizeof dbg, "[MakotoPet] runtime ABI %u.%u incompatible\n", abi >> 16, abi & 0xffffu);
+        PetDbgA(dbg);
+        Live2DShutdown();
+        return false;
+    }
+
+    // ★ DLL 与 ABI 都 OK：运行时已就绪。这个标志与「当前服装有没有模型」无关——
+    //   即使当前服装没有模型、本函数随后返回 false，DLL 也保持加载，
+    //   这样换到有模型的服装时能立刻加载，实现按服装粒度的自动升级/降级。
+    g_l2dLibReady = true;
+
+    // LoadConfig() 在 WinMain 里先于本函数执行，这里直接用存档中的服装，
+    // 重开程序自然回到上次穿的那套，不需要额外的配置项。
+    // warnOnFail=false：当前服装没模型时静默回退序列帧，绝不弹框。
+    // 注意失败时**不再** Live2DShutdown()——保留 DLL，供换装时复用。
+    if (!Live2DOpenRig(g_currentCostume, false, true)) {
+        PetDbgA("[MakotoPet] current costume has no model, use frame animation\n");
+        return false;
+    }
+    return true;
+}
+
+// ★ 表情 rig 切换函数前置声明（定义在情感联动区，Live2DAdvance 的到期回退需要）。
+static void L2dSwitchExprRig(int slot);
+
+// 推进一次逻辑帧。只在 30fps 定时器里调用，拖拽引起的额外重绘不重复推进，
+// 否则鼠标动得越快、模型动作越慢。
+static void Live2DAdvance() {
+    if (!g_l2dRig) return;
+    ULONGLONG now = GetTickCount64();
+    float dt = (float)FRAME_INTERVAL_MS / 1000.0f;
+    if (g_l2dLastMs) {
+        dt = (float)(now - g_l2dLastMs) / 1000.0f;
+        float cap = (float)FRAME_INTERVAL_MS / 1000.0f * 2.0f;   // 休眠醒来不补算
+        if (dt < 0.0f) dt = 0.0f;
+        if (dt > cap)  dt = cap;
+    }
+    g_l2dLastMs = now;
+    // ★ 表情到期自动回中性脸
+    if (g_l2dExprUntilMs && now >= g_l2dExprUntilMs) {
+        if (g_l2dMultiRig) {
+            L2dSwitchExprRig(0);             // 新结构：切回 base rig
+        } else if (g_p2l.expression) {
+            g_p2l.expression(g_l2dRig, -1);  // 旧结构：淡出参数化表情
+        }
+        g_l2dExprUntilMs = 0;
+    }
+    // ★ 待机物理微动改由 p2l_behaviors 的 idle sway（ParamAngleX/ParamBodyAngleX 周期摆动）
+    //   驱动摆锤链被动响应，不再注入外部风力——这是参考模型（psd2live 37 组物理链）的做法：
+    //   摆锤是被动件，靠输入参数变化驱动，硬注入风只会让发/裙摆动方向和节奏失真。
+    g_p2l.update(g_l2dRig, dt);
+    if (const char* f = g_p2l.rig_failure(g_l2dRig)) {
+        // 运行时内部 panic 不会展开到宿主，只会让句柄进入失效态；这里止损。
+        Live2DWarn(L"运行时求值失败，已停止 Live2D 渲染", f);
+        ReleaseAllRigs();   // 新结构下 g_l2dRig 是别名，必须整套统一释放，避免残留悬空指针
+        // ★ 求值失败会切回序列帧；若启动时跳过了解码，这里补启动兜底。
+        //   AnimLoadStart 幂等：后台加载完成后，主定时器每帧会自动同步帧缓存。
+        AnimLoadStart();
+        g_currentFrameIndex = 0;
+    }
+    g_l2dFrameDirty = true;
+}
+
+// 导演视线覆盖：LLM 可指定「看向主人/移开/低头」一小段时间，覆盖鼠标跟随。
+// 到期自动恢复跟随鼠标，避免表情切走后视线一直僵在某个方向。
+// （L2dGazeMode 枚举定义在 USE_LIVE2D 块外，见文件上方消息定义区）
+static int         g_l2dGazeMode     = L2D_GAZE_FOLLOW;
+static ULONGLONG   g_l2dGazeUntilMs  = 0;
+static void L2dSetGazeOverride(int mode, int holdMs) {
+    if (mode < 0) { g_l2dGazeMode = L2D_GAZE_FOLLOW; g_l2dGazeUntilMs = 0; return; }
+    if (mode > L2D_GAZE_DOWN) mode = L2D_GAZE_FOLLOW;
+    g_l2dGazeMode = mode;
+    g_l2dGazeUntilMs = GetTickCount64() + (ULONGLONG)(holdMs > 0 ? holdMs : 2500);
+}
+
+// 让视线朝鼠标所在的方向偏。p2l_look_at 各轴取值 -1..1，且 y 轴向上，
+// 屏幕 y 向下，因此要取反。量程取窗口自身的 1.5 倍：鼠标离角色约一个身位
+// 就到极限，靠近时的移动也能看出眼珠在动；超出一律钳制，副屏/负坐标不越界。
+static void Live2DLookAtCursor(const RECT& rc) {
+    if (!g_l2dRig || !g_p2l.look_at) return;
+    POINT pt = { 0, 0 };
+    if (!GetCursorPos(&pt)) return;
+    int w = rc.right - rc.left, h = rc.bottom - rc.top;
+    if (w <= 0 || h <= 0) return;
+    float cx = (float)(rc.left + rc.right) * 0.5f;
+    float cy = (float)(rc.top + rc.bottom) * 0.5f;
+    float x = ((float)pt.x - cx) / ((float)w * 1.5f);
+    float y = -((float)pt.y - cy) / ((float)h * 1.5f);
+    if (x > 1.0f) x = 1.0f; else if (x < -1.0f) x = -1.0f;
+    if (y > 1.0f) y = 1.0f; else if (y < -1.0f) y = -1.0f;
+    // ★ 导演视线覆盖：未到期则用固定视线，到期自动恢复跟随鼠标
+    ULONGLONG nowGaze = GetTickCount64();
+    if (g_l2dGazeMode != L2D_GAZE_FOLLOW && nowGaze >= g_l2dGazeUntilMs)
+        g_l2dGazeMode = L2D_GAZE_FOLLOW;
+    if (g_l2dGazeMode != L2D_GAZE_FOLLOW) {
+        switch (g_l2dGazeMode) {
+        case L2D_GAZE_AT_USER: x = -0.55f; y = 0.40f; break;  // 看主人（偏下、稍侧）
+        case L2D_GAZE_AWAY:    x = 0.85f;  y = 0.20f; break;   // 移开视线（傲娇）
+        case L2D_GAZE_DOWN:    x = 0.0f;   y = -0.75f; break;  // 低头（害羞）
+        }
+    }
+    g_p2l.look_at(g_l2dRig, x, y);
+}
+
+// ★ 八部位命中：判断客户区坐标落在人物哪个部位。
+// 运行时未导出命中测试接口，用不透明内容包围盒 + 比例窗口做几何近似。
+// 不同模型比例偏差大时调下面几个分界数即可，无需动运行时。
+// 纵向 v: 0=顶 1=底 -> 头 0~0.14 / 脸 0.14~0.30 / 胸 0.30~0.46 /
+// 腹 0.46~0.56 / 裙 0.56~0.76 / 腿 0.76~0.88 / 脚 0.88~1.0；手按"横向两侧"判定，独立于纵向。
+#define L2D_HEAD_V1 0.14f    // 头部纵向终点（头发/头顶）
+#define L2D_FACE_V1  0.30f
+#define L2D_CHEST_V1 0.46f
+#define L2D_BELLY_V1 0.56f    // 腹 0.46~0.56（下半让给裙摆带）
+#define L2D_SKIRT_V0 0.56f    // 裙摆带上沿：起算独立的"扯裙子"部位
+#define L2D_SKIRT_V1 0.76f    // 裙摆带下沿（腿上部）
+#define L2D_LEG_V1   0.88f
+#define L2D_HAND_V0  0.26f    // 手/手臂大致从胸部高度往下
+#define L2D_HAND_V1  0.78f    // 到腿部之前
+#define L2D_HAND_U_EDGE 0.24f // 横向偏离中心超过此值算"手/手臂"
+
+// ★ 八部位：头 / 脸 / 手 / 胸 / 腹 / 裙 / 腿 / 脚
+//   裙(L2D_PART_SKIRT)与摸头等同级：有自己的 LLM 描述，点击时注入裙摆物理冲量。
+//   BODY 作为兼容别名保留 (=CHEST)，防止旧引用悬空；新逻辑一律用具体部位。
+enum L2dBodyPart {
+    L2D_PART_NONE = 0,
+    L2D_PART_HEAD, L2D_PART_FACE, L2D_PART_HAND,
+    L2D_PART_CHEST, L2D_PART_BELLY, L2D_PART_SKIRT, L2D_PART_LEG, L2D_PART_FOOT,
+    L2D_PART_BODY = L2D_PART_CHEST
+};
+
+// ★ 部位 -> 自然语言描述：注入 LLM 的"主人刚刚做了什么"。
+//   直接给模型这句话，让它自己决定用什么表情/台词回应，而不是写死气泡文案。
+static const wchar_t* L2dTouchPhrase(L2dBodyPart part) {
+    switch (part) {
+        case L2D_PART_HEAD:  return L"主人摸了摸你的头";
+        case L2D_PART_FACE:  return L"主人轻轻戳了戳你的脸颊";
+        case L2D_PART_HAND:  return L"主人握住了你的手";
+        case L2D_PART_CHEST: return L"主人把手放在了你的胸口";
+        case L2D_PART_BELLY: return L"主人摸了摸你的肚子";
+        case L2D_PART_SKIRT: return L"主人轻轻扯了扯你的裙子";
+        case L2D_PART_LEG:   return L"主人碰了碰你的腿";
+        case L2D_PART_FOOT:  return L"主人碰了碰你的脚";
+        default:             return L"主人碰了碰你";
+    }
+}
+
+// ★ 触摸旁白（第三人称，给对话界面 / 历史用）：
+//   与上面的 L2dTouchPhrase 分开——那句是第一/二人称、直接喂给模型；
+//   这句是给玩家看的旁白，主语用"你"、宾语用"茉子"，读起来才顺。
+static const wchar_t* L2dTouchNarration(L2dBodyPart part) {
+    switch (part) {
+        case L2D_PART_HEAD:  return L"你摸了摸茉子的头";
+        case L2D_PART_FACE:  return L"你轻轻戳了戳茉子的脸颊";
+        case L2D_PART_HAND:  return L"你握住了茉子的手";
+        case L2D_PART_CHEST: return L"你把手放在了茉子的胸口";
+        case L2D_PART_BELLY: return L"你摸了摸茉子的肚子";
+        case L2D_PART_SKIRT: return L"你轻轻扯了扯茉子的裙子";
+        case L2D_PART_LEG:   return L"你碰了碰茉子的腿";
+        case L2D_PART_FOOT:  return L"你碰了碰茉子的脚";
+        default:             return L"你碰了碰茉子";
+    }
+}
+
+// ★ 各服装的实际纵向分界（归一化 v，0=人物顶 1=脚底）。
+//   数值来自 output28/<服装>/base/render/still.rgba 的 alpha 轮廓实测：
+//   制服/私服2 的蓬蓬裙最宽处（横向铺到 u≈0~1）在 v≈0.45~0.55，
+//   旧版把"裙"硬写成 0.56~0.76，其实那是腿的位置，点击自然对不上。
+struct L2dBodyBands {
+    float head, face, chest, belly, skirt1, leg;   // belly 同时是裙带上沿
+    bool  hasSkirt;
+};
+static L2dBodyBands BandsForCostume(Costume c) {
+    switch (c) {
+    case Costume::School:  // 校服(制服)：蓬蓬裙
+        return { 0.15f, 0.23f, 0.37f, 0.44f, 0.580f, 0.88f, true };
+    case Costume::Dress:   // 私服2：蓬蓬裙
+        return { 0.15f, 0.23f, 0.37f, 0.44f, 0.580f, 0.88f, true };
+    case Costume::Ninja:   // 忍者服：贴身短裙，裙带更短（下沿约 0.55）
+        return { 0.15f, 0.23f, 0.37f, 0.45f, 0.550f, 0.88f, true };
+    case Costume::Daily:   // 私服1：裤子，无裙
+        return { 0.15f, 0.23f, 0.37f, 0.50f, 0.580f, 0.88f, false };
+    }
+    return { 0.15f, 0.23f, 0.37f, 0.44f, 0.575f, 0.88f, true };
+}
+
+// 采样当前渲染帧 (px,py) 的颜色；该点几乎透明或无帧数据时返回 false。
+//   g_l2dRgba 是 p2l_render 输出的窗口尺寸 RGBA（top-down），客户区坐标可直接索引。
+static bool L2dSamplePixel(int px, int py, int& r, int& g, int& b) {
+    int w = g_currentW, h = g_currentH;
+    if (w <= 0 || h <= 0) return false;
+    if (px < 0 || py < 0 || px >= w || py >= h) return false;
+    size_t idx = ((size_t)py * (size_t)w + (size_t)px) * 4;
+    if (g_l2dRgba.size() < idx + 4) return false;
+    const uint8_t* p = &g_l2dRgba[idx];
+    if (p[3] < 24) return false;               // 透明处 = 没点到人物
+    r = p[0]; g = p[1]; b = p[2];
+    return true;
+}
+// 肤色判定（与建模时抠手用的阈值同源）：用于把"露出的手"和"裙摆布料"区分开。
+static bool L2dIsSkin(int r, int g, int b) {
+    return r > 150 && g > 108 && b > 88 &&
+           (r - b) > 16 && (r - g) > 6 && (r - g) < 90;
+}
+
+static L2dBodyPart Live2DHitPart(int px, int py) {
+    if (!g_l2dRig || !g_l2dContent.ok) return L2D_PART_NONE;
+    // 客户区像素 -> canvas 坐标：逆用渲染变换 (image = canvas*scale + t)
+    float scale = 0.0f, tx = 0.0f, ty = 0.0f;
+    Live2DFrameTransform(g_currentW, g_currentH, g_l2dCW, g_l2dCH,
+                         g_l2dContent, scale, tx, ty);
+    if (scale <= 0.0001f) return L2D_PART_NONE;
+    float cx = ((float)px - tx) / scale;
+    float cy = ((float)py - ty) / scale;
+    // canvas -> 内容包围盒归一化坐标 u/v
+    float u = (cx - g_l2dContent.x) / g_l2dContent.w;
+    float v = (cy - g_l2dContent.y) / g_l2dContent.h;
+    if (u < 0.0f || u > 1.0f || v < 0.0f || v > 1.0f) return L2D_PART_NONE;
+
+    // 像素级命中：有渲染帧时，点到透明处直接算未命中（比矩形包围盒更贴合身体轮廓）。
+    int pr = 0, pg = 0, pb = 0;
+    bool haveFrame = ((size_t)g_currentW * (size_t)g_currentH * 4 > 0) &&
+                     (g_l2dRgba.size() >= (size_t)g_currentW * (size_t)g_currentH * 4);
+    bool solid = L2dSamplePixel(px, py, pr, pg, pb);
+    if (haveFrame && !solid) return L2D_PART_NONE;
+
+    L2dBodyBands bd = BandsForCostume(g_currentCostume);
+
+    // 手：身体中段、靠两侧、且该处是"肤色"才算手。
+    //   用肤色而非固定 u 边界——蓬蓬裙横向铺到 u=0，按 u<0.24 会把裙摆误判成手。
+    if (v >= 0.24f && v <= 0.66f && (u < 0.30f || u > 0.70f) && L2dIsSkin(pr, pg, pb))
+        return L2D_PART_HAND;
+
+    // 纵向按各服装实测轮廓分带
+    if (v <= bd.head)  return L2D_PART_HEAD;
+    if (v <= bd.face)  return L2D_PART_FACE;
+    if (v <= bd.chest) return L2D_PART_CHEST;
+    if (v <= bd.belly) return L2D_PART_BELLY;
+    if (bd.hasSkirt && v <= bd.skirt1) return L2D_PART_SKIRT;
+    if (v <= bd.leg)   return L2D_PART_LEG;
+    return L2D_PART_FOOT;
+}
+
+// ★触摸物理反馈：扯裙子 —— 直接位移布料网格顶点，拉出去再弹性回弹。
+//   ★2026-11-25 调整：触发条件收紧为只有 L2D_PART_SKIRT（扯裙子判定）。
+//   为什么不用模型自带的物理链：Skirt/Trousers (preset) 那组输出被钳在 ±30，
+//   实测最多只能把整件衣服挪动二三十像素（约人物宽度的 8%），贴身短裙和短裤更是几乎看不出，
+//   而且它是"整件平移"，不是"被手抓住一角"。这里改成对网格顶点做局部剪切：
+//   腰线固定、下摆被拉向点击那一侧并轻微上提，再叠阻尼振荡（先拉出、过冲、回稳）。
+//   振幅以画布像素为单位，等于美术尺寸，四套衣服按各自衣长分别标定。
+//   强度用 llm.ini 的 TouchTugScale（默认 1.0，0~3）整体缩放；TouchSkirtEnable=0 关闭。
+//   旧 DLL 没有 p2l_cloth_tug 时自动退回原来的物理组冲量。
+static void L2dClothTug(int px, int py, L2dBodyPart part) {
+#if USE_LIVE2D
+    if (!Live2DReady()) return;
+    // ★只有"扯裙子"(L2D_PART_SKIRT)判定才触发布料扯动。
+    //   腹/腿/脚虽同在下半身，但分别是摸肚子/碰腿/碰脚，不该把裙子一起拽走；
+    //   旧条件把这四个部位都放进来，才导致点下半身任意处都会扯裙。
+    if (part != L2D_PART_SKIRT) return;
+    if (!GetLLMConfigInt(L"TouchSkirtEnable", 1, 0, 1)) return;
+
+    // 客户区像素 -> 画布像素（与 Live2DHitPart 同一套变换）。布料模型在画布坐标里工作。
+    float scale = 0.0f, tx = 0.0f, ty = 0.0f;
+    Live2DFrameTransform(g_currentW, g_currentH, g_l2dCW, g_l2dCH, g_l2dContent, scale, tx, ty);
+    if (scale <= 0.0001f) return;
+    float cx = ((float)px - tx) / scale;
+    float cy = ((float)py - ty) / scale;
+    float u = (cx - g_l2dContent.x) / g_l2dContent.w;
+    float dir = (u - 0.5f) * 2.0f;                   // -1(最左) .. +1(最右)
+    if (dir < -1.0f) dir = -1.0f;
+    if (dir >  1.0f) dir =  1.0f;
+    // 正中间不好判断往哪边扯，按靠近的一侧给一个最小方向，保证点中间也有反应。
+    if (dir > -0.25f && dir < 0.25f) dir = (u < 0.5f) ? -0.35f : 0.35f;
+
+    // 各服装实测标定（画布 1024 高、人物高约 1020）：
+    //   amp    下摆峰值位移(px)   radius 影响半径(px)
+    //   lift   上提比例(0~1)      freq 摆动频率(Hz)   damp 阻尼(1/s)
+    float amp, radius, lift, freq, damp;
+    switch (g_currentCostume) {
+    case Costume::School:   // 制服：蓬蓬裙，布量大、惯性大，摆幅最大、衰减最慢
+    case Costume::Dress:    // 私服2：同款蓬蓬裙
+        amp = 115.0f; radius = 310.0f; lift = 0.80f; freq = 2.2f; damp = 3.2f;
+        break;
+    case Costume::Ninja:    // 忍者服：贴身超短裙，只能小幅甩动，回弹快
+        amp = 65.0f;  radius = 200.0f; lift = 0.60f; freq = 3.0f; damp = 5.5f;
+        break;
+    default:                // 私服1：短裤，腰胯贴着身体，只在下摆外侧拖一点
+        amp = 58.0f;  radius = 135.0f; lift = 0.30f; freq = 3.4f; damp = 6.5f;
+        break;
+    }
+    double k = GetLLMConfigDouble(L"TouchTugScale", 1.0, 0.0, 3.0);
+    amp = (float)(amp * k);
+    if (amp < 0.5f) return;
+
+    // 四套模型的裙/裤都在 bottomwear 网格上（忍者服是短裙，私服1是短裤）。
+    if (g_p2l.cloth_tug) {
+        if (g_p2l.cloth_tug(g_l2dRig, "bottomwear,skirt", cx, cy, dir, -0.12f,
+                            amp, radius, lift, freq, damp))
+            return;
+    }
+    // 降级：旧 DLL 只支持物理组冲量（幅度明显小，但不至于没反应）。
+    if (g_p2l.physics_impulse)
+        g_p2l.physics_impulse(g_l2dRig, "skirt", dir * 0.8f, -0.2f);
+#else
+    (void)px; (void)py; (void)part;
+#endif
+}
+
+// 把一帧 RGBA 写进 32bpp DIB。p2l_render 输出 rows top first 的直通 RGBA，
+// DIB 用负 biHeight 同样是 top-down，两边行序一致，只需交换 R/B。
+static void Live2DBlit(int w, int h) {
+    if (!g_dibBits || !g_l2dRig) return;
+    const size_t pixels = (size_t)w * (size_t)h;
+    if (g_l2dFrameDirty) {
+        g_l2dRgba.assign(pixels * 4, 0);
+        float scale = 0.0f, tx = 0.0f, ty = 0.0f;
+        Live2DFrameTransform(w, h, g_l2dCW, g_l2dCH, g_l2dContent, scale, tx, ty);
+        float xf[6] = { scale, 0.0f, 0.0f, scale, tx, ty };
+        if (!g_p2l.render(g_l2dRig, g_l2dRgba.data(), (uint32_t)w, (uint32_t)h, xf, P2L_RENDER_STRAIGHT))
+            g_l2dRgba.assign(pixels * 4, 0);
+        g_l2dFrameDirty = false;
+    }
+    if (g_l2dRgba.size() < pixels * 4) return;
+    const uint8_t* s = g_l2dRgba.data();
+    uint8_t* d = g_dibBits;
+    for (size_t i = 0; i < pixels; ++i, s += 4, d += 4) {
+        d[0] = s[2]; d[1] = s[1]; d[2] = s[0]; d[3] = s[3];   // RGBA -> BGRA
+    }
+}
+
+// ULW_ALPHA 要求源位图的颜色已按 alpha 预乘。整块画布统一在这里转换，
+// 这样 GDI+ 画上去的状态栏也用同一套直通语义，不必分两处处理。
+static void Live2DPremultiply(int w, int h) {
+    if (!g_dibBits) return;
+    uint8_t* p = g_dibBits;
+    for (size_t i = 0, n = (size_t)w * (size_t)h; i < n; ++i, p += 4) {
+        unsigned a = p[3];
+        p[0] = (uint8_t)((unsigned)p[0] * a / 255u);
+        p[1] = (uint8_t)((unsigned)p[1] * a / 255u);
+        p[2] = (uint8_t)((unsigned)p[2] * a / 255u);
+    }
+}
+#endif
+
+// ------------------------------------------------------------------
+//  情感三联动：情绪标签 -> 动作片段 / TTS 语气 / 好感
+//  P2L 运行时没有表情通道，所以"表情"这一维用动作片段 + 视线 + 音效
+//  共同表达。模型返回 emotion 字符串，这里统一解析成枚举，再驱动三层反馈。
+//  定义在 #if 外：序列帧模式也要解析（用于心情提示与主动搭话）。
+// ------------------------------------------------------------------
+// ★ 8 个情绪 = 8 个表情槽，一一对应（枚举值就是槽位号，别再插中间值）。
+//   槽位顺序与 kL2dExprFile / live2d/{服装}/ 下的文件名严格一致：
+//     0 base(平静) 1 smile(开心) 2 smile_sulky(坏笑) 3 panic(惊讶)
+//     4 shy_blush(害羞) 5 embarrassed(难过) 6 thinking2(思考) 7 wonder(疑惑)
+//   prompt.txt 里的取值必须与这 8 个一一对应；改这里就要同步改 prompt。
+// ★ 枚举名 = 表情槽文件名（去掉下划线后首字母大写），枚举值 = 槽位号。
+//   prompt.txt 里必须原样使用下面的槽位名，不要再用"开心/生气"这类自造情绪名。
+enum class PetEmotion {
+    Base = 0,      // 0 base        平静
+    Smile,         // 1 smile       微笑
+    SmileSulky,    // 2 smile_sulky 坏笑
+    Panic,         // 3 panic       惊慌
+    ShyBlush,      // 4 shy_blush   害羞脸红
+    Embarrassed,   // 5 embarrassed 尴尬抿嘴
+    Thinking,      // 6 thinking2   思考
+    Wonder         // 7 wonder      疑惑
+};
+
+// 导演指令：LLM 一轮回复里除 emotion 外可附带的多模态演出参数。
+// 由后台 LLM 线程 new 出来，经 WM_APP_DIRECTOR 投递主线程，主线程用完 delete。
+// 所有字段都有"缺省=无"语义，模型没输出时完全退回旧行为（只按 emotion 演出）。
+struct L2dDirectorCmd {
+    PetEmotion emotion   = PetEmotion::Base;
+    int        moodDelta = 0;     // 心情微调（-1/0/1）
+    float      intensity = 0.0f;  // 情绪强度 0..1；<=0 表示模型没给，忽略
+    int        action    = -1;    // 动作槽覆盖：-1=不覆盖，0=待机,1=思考,2=开心
+    int        gaze      = -1;    // 视线覆盖：-1=不覆盖，见 L2dGazeMode
+    int        gazeHoldMs = 2500; // 视线保持时长
+};
+
+// ==================================================================
+//  玩法：Live2D 动作片段调度（轮播 + 好感解锁）
+//
+//  p2l_runtime 只导出 clip_count / play，不导出片段名。4 套 .p2lrt 的
+//  CLIP 段均为 3 个片段，约定槽位 0=待机、1=点头/思考、2=摇摆/开心。
+//  若你的模型片段顺序不同，改这里的槽位常量即可；运行时还会用 clip_count
+//  再兜底一次，片段不足时安全回退到待机，绝不越界。
+// ==================================================================
+#if USE_LIVE2D
+enum L2dSlot { L2D_IDLE = 0, L2D_THINK = 1, L2D_PEACE = 2 };
+#define L2D_SLOT_COUNT 3
+// ★ 情绪枚举必须与 8 个表情槽一一对应：数量或顺序对不上就直接编译失败，
+//   避免"prompt 加了新情绪、表情表没加"这种只在运行时才发现的错配。
+static_assert((int)PetEmotion::Wonder + 1 == L2D_EXPR_COUNT,
+              "PetEmotion 必须正好 8 个，且顺序与 kL2dExprFile 一致（枚举值即表情槽位号）");
+
+// 槽位好感门槛：待机/思考恒可用，"开心"需累计好感达标才进入待机轮播。
+// 与 UNLOCK_DEF 第一档（背景音乐 15）错开，让养成节奏有层次。
+#define L2D_PEACE_NEED 30
+
+// 部位点击（摸头）：连击窗口与彩蛋阈值
+static const ULONGLONG PAT_COMBO_WINDOW_MS = 2500;   // 两次摸头算连击的最大间隔
+static const ULONGLONG PAT_REWARD_COOLDOWN = 4000;   // 彩蛋奖励冷却，防连点刷好感
+static const int       PAT_COMBO_NEED       = 5;      // 连击几次触发彩蛋
+static ULONGLONG g_lastPatMs    = 0;
+static ULONGLONG g_lastPatEggMs = 0;
+static int       g_patCombo     = 0;
+
+// 播放一个片段。slot 越界一律回退待机，模型片段不足时安全降级。
+static void L2dPlayClip(int slot) {
+    if (!g_l2dRig || !g_p2l.play || !g_p2l.clip_count) return;
+    int n = (int)g_p2l.clip_count(g_l2dRig);
+    if (n <= 0) return;
+    if (slot < 0 || slot >= n) slot = L2D_IDLE;
+    g_l2dLastClipSlot = slot;          // 记住当前动作，切表情 rig 后据此重放
+    g_p2l.play(g_l2dRig, slot);
+    g_l2dFrameDirty = true;
+}
+
+// 情绪 -> 动作槽位。只有 3 个片段可用（0待机/1点头思考/2摇摆开心），
+// 按语义就近归类；表情由 8 个独立 rig 承担，动作只做辅助。
+// 依赖 L2D_* 槽位常量，故留在 #if USE_LIVE2D 块内；序列帧模式不使用本映射。
+static int L2dSlotForEmotion(PetEmotion e) {
+    switch (e) {
+    case PetEmotion::Smile: return L2D_PEACE;   // 开心 -> 摇摆
+    case PetEmotion::Panic:
+    case PetEmotion::ShyBlush:
+    case PetEmotion::Embarrassed:
+    case PetEmotion::Thinking:
+    case PetEmotion::Wonder: return L2D_THINK;   // 静态情绪 -> 点头/思考
+    // 坏笑不摇摆开心：用待机站姿 + 坏笑表情表达，比让坏笑的身体做开心动作自然。
+    case PetEmotion::SmileSulky: return L2D_IDLE;
+    default:                    return L2D_IDLE;    // 平静 -> 待机
+    }
+}
+
+// ★ 8 张原作差分的表情槽位（与运行时 school8 的 atlas 槽位严格对齐）：
+//   0 base 中性 / 1 smile 大笑 / 2 smile_sulky 坏笑 / 3 panic 惊慌
+//   4 shy_blush 害羞脸红 / 5 embarrassed 尴尬 / 6 thinking2 思考 / 7 wonder 疑惑
+enum School8Slot { S8_BASE=0, S8_SMILE=1, S8_SULKY=2, S8_PANIC=3,
+                   S8_SHYPOS=4, S8_EMBARR=5, S8_THINK=6, S8_WONDER=7 };
+
+// ★ 情绪 -> 8 差分槽位（school8 模式直接用槽位号，不查 EXPR 表——物理模型无 EXPR chunk）。
+//   PetEmotion 的枚举值已经是 0..7，与 School8Slot 一一对应，直接取序号即可。
+static int L2dEmotionSlot8(PetEmotion e) {
+    int s = (int)e;
+    return (s >= S8_BASE && s <= S8_WONDER) ? s : S8_BASE;
+}
+
+// ★ 旧模型（有 EXPR chunk）的情绪 -> 表情 id。旧 DLL/旧模型沿用的 7 槽英文 id。
+//   旧 7 槽没有「思考 / 疑惑」，返回 nullptr 时 L2dSetExpression 会淡出成中性脸。
+static const char* L2dEmotionExprId(PetEmotion e) {
+    switch (e) {
+    case PetEmotion::Smile: return "smile";
+    case PetEmotion::SmileSulky: return "angry";
+    case PetEmotion::Panic: return "surprised";
+    case PetEmotion::ShyBlush: return "shy";
+    case PetEmotion::Embarrassed: return "sad";
+    default:                    return nullptr;   // 平静/思考/疑惑：保持中性脸
+    }
+}
+
+// ★ 设置表情：按 id 名在当前 rig 的表情表里查找索引，找到则淡入、其余淡出。
+//   -1 表示淡出全部（中性脸）。不缓存索引——换装后 rig 变了，现查更安全。
+//   旧 DLL 没有表情 API 时本函数静默返回，功能优雅降级。
+// ★ 新结构：情绪 -> 8 表情槽位。枚举值就是槽位号，不再有手工映射表。
+static int L2dExprSlotForEmotion(PetEmotion e) {
+    int s = (int)e;
+    return (s >= 0 && s < L2D_EXPR_COUNT) ? s : 0;
+}
+
+// ★ 把当前显示的 rig 切到指定表情槽位（仅新结构）。
+//   所有表情共用 base 校准出的 g_l2dContent / g_l2dCW / g_l2dCH，切换时不跳位。
+static void L2dSwitchExprRig(int slot) {
+    if (slot < 0 || slot >= L2D_EXPR_COUNT) return;
+    P2lRig* target = g_l2dExprRigs[slot].rig;
+    if (!target || target == g_l2dRig) { g_l2dCurExpr = slot; return; }
+    g_l2dRig = target;
+    g_l2dCurExpr = slot;
+    // 目标 rig 可能是刚从冻结状态唤醒的：稳一下物理、确保行为层开着。
+    g_p2l.physics_stabilize(target);
+    if (g_p2l.behaviors) g_p2l.behaviors(target, P2L_BEHAVIOR_BLINK | P2L_BEHAVIOR_BREATH | P2L_BEHAVIOR_LOOK);
+    // ★ 在"新" rig 上重放本轮动作。动作片段是 rig 私有的，不重放的话
+    //   L2dPlayClip -> L2dSwitchExprRig 这条常见顺序会让动作停在旧 rig 上，
+    //   玩家看到的就是"表情对了但身体没动"。回中性脸时同样重放，避免动作被打断。
+    if (g_l2dLastClipSlot > L2D_IDLE) L2dPlayClip(g_l2dLastClipSlot);
+    g_l2dFrameDirty = true;
+}
+
+static void L2dSetExpression(PetEmotion e) {
+    if (!g_l2dRig) return;
+
+    // ===== 新结构：直接切 rig 指针，表情即独立烘焙模型 =====
+    if (g_l2dMultiRig) {
+        int slot = L2dExprSlotForEmotion(e);
+        L2dSwitchExprRig(slot);
+        if (slot != 0) g_l2dExprUntilMs = GetTickCount64() + L2D_EXPR_HOLD_MS;
+        else           g_l2dExprUntilMs = 0;   // base 中性不需要回退
+        return;
+    }
+
+    // ===== 旧结构：DLL 内嵌 atlas / EXPR 参数化表情 =====
+    if (!g_p2l.expression) return;
+    int32_t idx = -1;                       // 默认淡出所有表情
+
+    if (g_school8Active) {
+        int slot = L2dEmotionSlot8(e);
+        idx = (slot == S8_BASE) ? -1 : slot;
+    } else {
+        const char* want = L2dEmotionExprId(e);
+        if (want && g_p2l.expression_id && g_p2l.expression_count) {
+            uint32_t n = g_p2l.expression_count(g_l2dRig);
+            for (uint32_t i = 0; i < n; ++i) {
+                const char* id = g_p2l.expression_id(g_l2dRig, i);
+                if (id && strcmp(id, want) == 0) { idx = (int32_t)i; break; }
+            }
+        }
+    }
+    g_p2l.expression(g_l2dRig, idx);        // 找到则淡入，没找到/中性则淡出
+    if (idx >= 0) g_l2dExprUntilMs = GetTickCount64() + L2D_EXPR_HOLD_MS;
+    else          g_l2dExprUntilMs = 0;     // 中性脸不需要回退
+    g_l2dFrameDirty = true;
+}
+#endif   // USE_LIVE2D
+
+// 情绪 -> TTS 语气（语速 / 音调浮动系数，乘在 ini 基准值上）。
+// GPT-SoVITS 的 speed_factor 0.5~2.0；这里给温和偏移，避免过度变声。
+// 放在 #if 外：序列帧模式的 TTS 也要随情绪变调。
+struct EmotionTone { double speed; double temperature; };
+static EmotionTone ToneForEmotion(PetEmotion e) {
+    switch (e) {
+    case PetEmotion::Smile: return { 1.10, 1.10 };
+    case PetEmotion::SmileSulky: return { 1.06, 0.95 };
+    case PetEmotion::Panic: return { 1.16, 1.20 };
+    case PetEmotion::ShyBlush: return { 0.94, 1.05 };
+    case PetEmotion::Embarrassed: return { 0.88, 0.85 };
+    case PetEmotion::Thinking: return { 0.96, 0.92 };
+    case PetEmotion::Wonder: return { 1.02, 1.02 };
+    default:                    return { 1.00, 1.00 };   // 平静
+    }
+}
+
+// 情绪解析放在 #if 外：序列帧模式也要解析（用于好感修正与主动搭话），
+// 只是不驱动 Live2D 动作。模型可能输出中文/英文/带空格，这里统一小写后匹配。
+//
+// ★★ prompt 取值 = 表情槽文件名，完全一致（改一处必须改三处）★★
+//    槽 0 base        平静       槽 4 shy_blush   害羞脸红
+//    槽 1 smile       微笑       槽 5 embarrassed 尴尬抿嘴
+//    槽 2 smile_sulky 坏笑   槽 6 thinking2   思考
+//    槽 3 panic       惊慌       槽 7 wonder      疑惑
+//   下面先认"槽位原名"（长名优先，避免 smile_sulky 被 smile 抢先命中），
+//   再认旧情绪词/中文作兜底，保证老 prompt 或模型自由发挥也不会解析失败。
+static PetEmotion ParseEmotion(const std::string& raw) {
+    std::string s;
+    s.reserve(raw.size());
+    for (char c : raw) {
+        if (c == ' ' || c == '"' || c == '\'' || c == '\r' || c == '\n') continue;
+        s += (char)tolower((unsigned char)c);
+    }
+    auto has = [&s](const char* k) { return s.find(k) != std::string::npos; };
+
+    // 1) 槽位原名：长名必须先判，否则 "smile_sulky" 会被 "smile" 截断。
+    if (has("smile_sulky")) return PetEmotion::SmileSulky;
+    if (has("shy_blush"))   return PetEmotion::ShyBlush;
+    if (has("thinking2"))   return PetEmotion::Thinking;
+    if (has("embarrassed")) return PetEmotion::Embarrassed;
+    if (has("panic"))       return PetEmotion::Panic;
+    if (has("wonder"))      return PetEmotion::Wonder;
+    if (has("smile"))       return PetEmotion::Smile;
+    if (has("base"))        return PetEmotion::Base;
+
+    // 2) 旧情绪词 / 中文兜底（prompt 已不再使用这些写法）。
+    if (has("angry") || has("生气") || has("愤怒") || has("恼") || has("坏笑") || has("撇嘴")) return PetEmotion::SmileSulky;
+    if (has("shy") || has("害羞") || has("羞") || has("脸红")) return PetEmotion::ShyBlush;
+    if (has("think") || has("思考") || has("沉思") || has("琢磨")) return PetEmotion::Thinking;
+    if (has("sad") || has("难过") || has("伤心") || has("委屈") || has("低落") ||
+        has("消沉") || has("gloom") || has("阴沉") || has("沮丧") || has("郁闷") ||
+        has("阴郁") || has("尴尬")) return PetEmotion::Embarrassed;
+    if (has("surpris") || has("惊讶") || has("惊") || has("慌")) return PetEmotion::Panic;
+    if (has("puzzl") || has("confus") || has("curious") || has("疑惑") ||
+        has("困惑") || has("好奇") || has("迷茫")) return PetEmotion::Wonder;
+    if (has("happy") || has("开心") || has("高兴") || has("joy") || has("love") ||
+        has("喜爱") || has("喜欢") || has("亲昵") || has("excited") || has("激动") ||
+        has("兴奋") || has("欣喜")) return PetEmotion::Smile;
+    if (has("neutral") || has("平静") || has("normal")) return PetEmotion::Base;
+    return PetEmotion::Base;
+}
+
+// 槽位 -> 中文标签（气泡标题用；prompt 侧只用槽位原名，这里给人看用中文）
+static const wchar_t* EmotionLabel(PetEmotion e) {
+    switch (e) {
+    case PetEmotion::Smile: return L"微笑";
+    case PetEmotion::SmileSulky: return L"坏笑";
+    case PetEmotion::Panic: return L"惊慌";
+    case PetEmotion::ShyBlush: return L"害羞";
+    case PetEmotion::Embarrassed: return L"抿嘴";
+    case PetEmotion::Thinking: return L"思考";
+    case PetEmotion::Wonder: return L"疑惑";
+    default:                      return L"平静";
+    }
+}
+
+// 情绪 -> 心情微调（叠加到 affinityMood，负值只压心情不动累计值）。
+// 让"情绪"这一层在爱心显示上也能被看见，形成动作/语气/数值三重反馈。
+static int EmotionMoodDelta(PetEmotion e) {
+    switch (e) {
+    case PetEmotion::Smile: return 1;
+    case PetEmotion::Embarrassed:
+    case PetEmotion::SmileSulky: return -1;
+    default:                    return 0;
+    }
+}
+
+// ------------------------------------------------------------------
+//  主动搭话：定时让茉子主动说一句，结合时段与当前状态。
+//  配置写在 llm.ini 的 [LLM] 段：
+//    ProactiveEnable     默认 1
+//    ProactiveIntervalSec 默认 180（两次主动搭话的最小间隔）
+//    ProactiveIdleSec     默认 60 （多久没有用户输入后才允许主动搭话）
+//    ProactiveEmotionAffinity 默认 1（情绪是否叠加心情微调）
+// ------------------------------------------------------------------
+static ULONGLONG g_lastProactiveMs   = 0;   // 上次主动搭话"成功出气泡"的时刻
+static ULONGLONG g_proactiveStartMs  = 0;   // 本次主动搭话线程启动时刻（卡死兜底用）
+static ULONGLONG g_lastUserInputMs   = 0;   // 上次用户输入时刻（避免打断用户）
+static bool      g_proactiveRunning  = false; // 后台线程互斥，防重复触发
+
+// ★触摸互动：LLM 回应互斥 + 节流。触摸会真实发起网络请求，必须防连点堆积。
+static volatile bool g_touchRunning  = false; // 触摸 LLM 请求进行中
+static ULONGLONG g_lastTouchAskMs    = 0;     // 上次发起触摸请求的时刻（节流用）
+
+// 当前时段描述，注入主动搭话的 prompt，让台词呼应真实时间。
+static const wchar_t* TimeOfDayLabel() {
+    SYSTEMTIME st; GetLocalTime(&st);
+    int h = st.wHour;
+    if (h >= 5  && h < 9)  return L"清晨";
+    if (h >= 9  && h < 12) return L"上午";
+    if (h >= 12 && h < 14) return L"中午";
+    if (h >= 14 && h < 18) return L"下午";
+    if (h >= 18 && h < 22) return L"晚上";
+    return L"深夜";
+}
+
 static bool g_bStartupPlayed = false;
 const float CHAR_RATIO = 1.0f;
 
@@ -175,6 +1399,10 @@ int g_currentBGMIndex = 0;
 // 翻唱变调档位：-1 / 0 / +1（男声源配女声模型通常选 +1），存 config.ini 的 [RVC] Octave
 // 实际半音数 = 档位 x RVC_OCTAVE_SEMI
 int g_rvcOctave = 0;
+
+// ★ 语音朗读总开关。必须声明在 LoadConfig 之前（那里要读 [TTS] TtsEnable），
+//   具体实现（切句/队列）在后面的 TTS 模块里。
+static std::atomic<bool> g_ttsVoiceOn{ true };
 
 int g_costumeChangeIndex = 0;
 
@@ -277,7 +1505,7 @@ static void RvcSetProgress(int pct) {
 }
 
 // ================= 静态分析安全工具 =================
-// 集中提供"带检查"的包装，顺带消除 MSVC /analyze 的 C6011 / C6031 / C6262：
+// 集中提供"带检查"的包装：
 // 不只是为了消警告，窗口已销毁、文件读取失败这些边界情况也确实更安全。
 
 // 取窗口矩形：防御 hwnd 为空或已销毁，并检查返回值
@@ -383,8 +1611,12 @@ static bool LoadWavFromMemory(const std::vector<char>& wavData, XSound& s) {
         memcpy(&cs, wavData.data() + pos + 4, 4);
         if (!memcmp(cid, "fmt ", 4)) {
             WAVEFORMATEX tmp{};
-            DWORD tr = min(cs, (DWORD)sizeof(WAVEFORMATEX));
-            memcpy(&tmp, wavData.data() + pos + 8, tr);
+            // ★安全：fmt 块声明长度可能大于文件实际剩余字节（截断/损坏文件）。
+            //   只保证 pos+8 在界内还不够，memcpy 会按 cs 读出去 → 越界读。
+            size_t availFmt = wavData.size() - ((size_t)pos + 8);
+            DWORD tr = (DWORD)min((size_t)cs, sizeof(WAVEFORMATEX));
+            if ((size_t)tr > availFmt) tr = (DWORD)availFmt;
+            if (tr) memcpy(&tmp, wavData.data() + pos + 8, tr);
             if (tmp.wFormatTag == 1) { s.wfx = tmp; s.wfx.cbSize = 0; gotfmt = true; }
         } else if (!memcmp(cid, "data", 4)) {
             // ★ 声明长度可能超过实际剩余字节，必须裁剪，避免越界读与超大内存分配
@@ -488,6 +1720,7 @@ static void AudioX_Preload() {
     for (int i = 0; i < 3; i++) { wchar_t nm[32]; wsprintfW(nm, L"costume%d.wav", i + 1); LoadWav(sf(nm).c_str(), g_costume[i]); }
 }
 
+
 // ---- BGM 扫描 ----
 void ScanBGMDirectory() {
     g_bgmFileList.clear(); g_bgmDisplayNameList.clear();
@@ -541,32 +1774,86 @@ static void PlayStartupAudio() { XSoundPlay(g_startup, false); }
 static void PlayExitAudio() { XSoundPlay(g_exit, false); }
 
 // ================= 配置读写 =================
-void SaveConfig() {
+// ★ 窗口几何 / 换装存档（序列帧与 Live2D 共用）
+//   两条渲染路径都要在退出时保存服装、窗口位置和大小；
+//   这里补齐三处，保证 Live2D 路径也能记住：
+//     1) 只在 WM_DESTROY 落盘一次 —— 用任务管理器结束进程就什么都没写下去；
+//     2) WritePrivateProfileString 只写内存缓存，进程被强杀时缓存直接丢弃，
+//        必须显式 flush 才真的落盘；
+//     3) Live2D 的窗口尺寸是按模型宽高比重算的，而模型加载发生在"应用存档位置"
+//        之后，重算会把刚读出来的尺寸/坐标顶掉（见 Live2DApplyWindowSize /
+//        RestoreSavedGeometry）。
+static bool      g_geomDirty    = false;   // 位置/尺寸变过、还没落盘
+static ULONGLONG g_geomDirtyMs  = 0;
+static int       g_restoreWinH  = 0;       // 存档里的窗口高度（0 = 没有存档）
+
+static void MarkGeomDirty() { g_geomDirty = true; g_geomDirtyMs = GetTickCount64(); }
+
+static bool ConfigIniPath(std::wstring& out) {
     wchar_t exePath[MAX_PATH];
-    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+    if (!GetModuleFileNameW(nullptr, exePath, MAX_PATH)) return false;
     PathRemoveFileSpecW(exePath);
-    wchar_t iniPath[MAX_PATH];
-    wsprintfW(iniPath, L"%s\\config.ini", exePath);
+    out = std::wstring(exePath) + L"\\config.ini";
+    return true;
+}
+
+// 只写几何：拖动、滚轮缩放、换装都会走到这里，写入量很小
+static void SaveWindowState() {
+    std::wstring ini;
+    if (!ConfigIniPath(ini)) return;
+    int x = 0, y = 0, h = 0;
+    RECT rc{};
+    if (g_hwnd && IsWindow(g_hwnd) && GetWindowRect(g_hwnd, &rc)
+        && rc.right > rc.left && rc.bottom > rc.top) {
+        x = rc.left; y = rc.top; h = rc.bottom - rc.top;
+    } else if (g_winPosKnown && g_currentH > 0) {
+        // 窗口已销毁（或还没建）：退回逻辑坐标，绝不把 0,0 写进存档
+        x = g_winX; y = g_winY; h = g_currentH;
+    } else {
+        return;
+    }
+    // 宽度按 2:3 基准反推，而不是存 Live2D 那个"贴着人物收紧"的窄宽度：
+    // 高度才是用户调出来的缩放，Live2D 每次加载都会按模型比例重算宽度，
+    // 但序列帧路径直接吃这个宽度——存窄宽度会让序列帧人物被横向压扁。
+    int wStore = (int)(BASE_W * ((float)h / (float)BASE_H) + 0.5f);
+    if (wStore < 40) wStore = 40;
+    wchar_t buf[32];
+    wsprintfW(buf, L"%d", x); WritePrivateProfileStringW(L"State", L"PosX", buf, ini.c_str());
+    wsprintfW(buf, L"%d", y); WritePrivateProfileStringW(L"State", L"PosY", buf, ini.c_str());
+    wsprintfW(buf, L"%d", wStore); WritePrivateProfileStringW(L"State", L"WinW", buf, ini.c_str());
+    wsprintfW(buf, L"%d", h); WritePrivateProfileStringW(L"State", L"WinH", buf, ini.c_str());
+    // 窗口高度就是缩放尺度的真身：写回 Zoom，两条渲染路径才会拿到同一个尺度
+    float z = (float)h / (float)BASE_H;
+    if (z < 0.5f) z = 0.5f;
+    if (z > 3.0f) z = 3.0f;
+    wsprintfW(buf, L"%.2f", z);
+    WritePrivateProfileStringW(L"State", L"Zoom", buf, ini.c_str());
+    g_geomDirty = false;
+}
+
+// ★ 显式 flush 配置缓存：不调用它，写入只停在内存里，
+//   进程被强杀/崩溃重启后读到的还是旧值 —— 表现就是"退出时的状态没记住"。
+static void FlushConfigCache() {
+    std::wstring ini;
+    if (ConfigIniPath(ini)) WritePrivateProfileStringW(nullptr, nullptr, nullptr, ini.c_str());
+}
+
+void SaveConfig() {
+    std::wstring ini;
+    if (!ConfigIniPath(ini)) return;
     wchar_t buf[32];
     wsprintfW(buf, L"%d", (int)g_currentCostume);
-    WritePrivateProfileStringW(L"State", L"Costume", buf, iniPath);
+    WritePrivateProfileStringW(L"State", L"Costume", buf, ini.c_str());
     wsprintfW(buf, L"%d", g_currentVolume);
-    WritePrivateProfileStringW(L"State", L"Volume", buf, iniPath);
-    wsprintfW(buf, L"%.2f", g_zoom);
-    WritePrivateProfileStringW(L"State", L"Zoom", buf, iniPath);
-    RECT rc; GetWindowRect(g_hwnd, &rc);
-    wsprintfW(buf, L"%d", rc.left);
-    WritePrivateProfileStringW(L"State", L"PosX", buf, iniPath);
-    wsprintfW(buf, L"%d", rc.top);
-    WritePrivateProfileStringW(L"State", L"PosY", buf, iniPath);
-    wsprintfW(buf, L"%d", rc.right - rc.left);
-    WritePrivateProfileStringW(L"State", L"WinW", buf, iniPath);
-    wsprintfW(buf, L"%d", rc.bottom - rc.top);
-    WritePrivateProfileStringW(L"State", L"WinH", buf, iniPath);
+    WritePrivateProfileStringW(L"State", L"Volume", buf, ini.c_str());
     wsprintfW(buf, L"%d", g_currentBGMIndex);
-    WritePrivateProfileStringW(L"BGM", L"Index", buf, iniPath);
+    WritePrivateProfileStringW(L"BGM", L"Index", buf, ini.c_str());
     wsprintfW(buf, L"%d", g_rvcOctave);
-    WritePrivateProfileStringW(L"RVC", L"Octave", buf, iniPath);
+    WritePrivateProfileStringW(L"RVC", L"Octave", buf, ini.c_str());
+    wsprintfW(buf, L"%d", (int)g_renderMode);
+    WritePrivateProfileStringW(L"State", L"RenderMode", buf, ini.c_str());
+    SaveWindowState();          // 位置 / 尺寸 / 缩放
+    FlushConfigCache();         // 立刻落盘，强杀进程也不丢
 }
 
 // 解锁判定函数定义在"成就统计系统"区（要用 PetStats），这里先声明给读档逻辑用
@@ -576,11 +1863,9 @@ static int  CostumeUnlock(int idx);
 static bool AffinityMaxed();
 
 void LoadConfig() {
-    wchar_t exePath[MAX_PATH];
-    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
-    PathRemoveFileSpecW(exePath);
-    wchar_t iniPath[MAX_PATH];
-    wsprintfW(iniPath, L"%s\\config.ini", exePath);
+    std::wstring iniPathW;
+    if (!ConfigIniPath(iniPathW)) return;
+    const wchar_t* iniPath = iniPathW.c_str();
     if (!PathFileExistsW(iniPath)) return;
     wchar_t buf[32];
     GetPrivateProfileStringW(L"State", L"Costume", L"0", buf, 32, iniPath);
@@ -594,6 +1879,15 @@ void LoadConfig() {
     }
     GetPrivateProfileStringW(L"State", L"Volume", L"700", buf, 32, iniPath);
     g_currentVolume = _wtoi(buf);
+    // 上次选的渲染方式：这里只记"想用哪个"，实际用哪个由素材扫描结果决定（见 WinMain）。
+    // ★ 老存档没有这一项时默认 Live2D —— 沿用"有模型就用模型"的旧行为，
+    //   不能让升级后的第一次启动突然退回序列帧。
+    {
+        wchar_t rm[16];
+        GetPrivateProfileStringW(L"State", L"RenderMode", L"", rm, 16, iniPath);
+        g_wantMode = (rm[0] == L'\0') ? RM_LIVE2D
+                                      : ((_wtoi(rm) != 0) ? RM_LIVE2D : RM_FRAMES);
+    }
     GetPrivateProfileStringW(L"State", L"Zoom", L"1.0", buf, 32, iniPath);
     g_zoom = (float)_wtof(buf);
     if (g_zoom < 0.5f) g_zoom = 0.5f;
@@ -602,7 +1896,10 @@ void LoadConfig() {
     g_savedPosX = _wtoi(buf);
     GetPrivateProfileStringW(L"State", L"PosY", L"-1", buf, 32, iniPath);
     g_savedPosY = _wtoi(buf);
-    g_hasSavedPos = (g_savedPosX >= 0 && g_savedPosY >= 0);
+    // 放宽拖动边界后窗口可以部分探出屏幕边缘，位置可能是负数。
+    // 仍把 (-1,-1) 当作旧版「没有存过位置」的哨兵。
+    g_hasSavedPos = (g_savedPosX > -10000 && g_savedPosY > -10000
+                     && !(g_savedPosX == -1 && g_savedPosY == -1));
     GetPrivateProfileStringW(L"State", L"WinW", L"", buf, 32, iniPath);
     if (buf[0] != L'\0') {
         g_currentW = _wtoi(buf);
@@ -619,11 +1916,33 @@ void LoadConfig() {
         g_currentW = (int)(BASE_W * g_zoom);
         g_currentH = (int)(BASE_H * g_zoom);
     }
+    // ★ Live2D 专用：把存档高度记下来，模型加载时以它为准。
+    //   Live2DApplyWindowSize() 一律按 g_zoom 重算高度，
+    //   读档得到的 WinH 当场被顶掉 —— 这是"Live2D 记不住窗口大小"的直接原因。
+    g_restoreWinH = g_currentH;
+    // 窗口高度才是缩放的唯一真身：用反推值覆盖 [State] Zoom，
+    // 避免"高度是 1.4 倍、缩放却还是 1.0"这种两条路径尺度不一致。
+    {
+        float z = (float)g_currentH / (float)BASE_H;
+        if (z < 0.5f) z = 0.5f;
+        if (z > 3.0f) z = 3.0f;
+        g_zoom = z;
+    }
     g_currentBGMIndex = GetPrivateProfileIntW(L"BGM", L"Index", 0, iniPath);
     if (g_currentBGMIndex < 0 || g_currentBGMIndex >= (int)g_bgmFileList.size()) g_currentBGMIndex = 0;
     g_rvcOctave = GetPrivateProfileIntW(L"RVC", L"Octave", 0, iniPath);
     if (g_rvcOctave < -1) g_rvcOctave = -1;
     if (g_rvcOctave > 1) g_rvcOctave = 1;
+    // ★ 语音朗读开关：[TTS] TtsEnable，默认开。菜单里改过就记住，下次启动沿用。
+    g_ttsVoiceOn.store(GetPrivateProfileIntW(L"TTS", L"TtsEnable", 1, iniPath) != 0);
+    // 半身状态不再存开关：由窗口最后停留的位置推导，WinMain 在尺寸定下来后刷新。
+    g_halfBody = false;
+    {
+        char dbg[192];
+        sprintf_s(dbg, sizeof dbg, "[State] costume=%d pos=%d,%d size=%dx%d zoom=%.2f\n",
+                  (int)g_currentCostume, g_savedPosX, g_savedPosY, g_currentW, g_currentH, g_zoom);
+        PetDbgA(dbg);
+    }
 }
 
 // ==================== 成就统计系统 ====================
@@ -802,7 +2121,7 @@ static int CostumeUnlock(int idx) {
     }
 }
 
-// 取 stats.ini 全路径：用 GetExeDir 检查返回值，并用安全版格式化（消除 C6031）
+// 取 stats.ini 全路径：检查 GetExeDir 返回值，用安全版格式化
 static bool StatsIniPath(std::wstring& out) {
     std::wstring dir;
     if (!GetExeDir(dir)) return false;
@@ -980,6 +2299,38 @@ static bool StatsAddAffinity(int n) {
     return true;
 }
 
+#if USE_LIVE2D
+// 动作槽位是否已解锁：DEV 模式全开，正式版按累计好感门槛。
+// 待机(0)/思考(1)是基础动作恒可用；开心(2)要攒够好感才进待机轮播池。
+static bool L2dSlotUnlocked(int slot) {
+    if (slot <= L2D_THINK) return true;
+#if DEV_UNLOCK_ALL
+    return true;
+#else
+    return g_stat.affinityTotal >= L2D_PEACE_NEED;
+#endif
+}
+
+// AnimState -> 片段槽位。Run（拖拽）沿用思考槽：让拖动时人物也有反应，
+// 松手回待机；不新增槽位是因为模型只有 3 个片段，硬映射会越界。
+static int L2dSlotForState(AnimState s) {
+    switch (s) {
+    case AnimState::Think: return L2D_THINK;
+    case AnimState::Peace: return L2D_PEACE;
+    case AnimState::Run:   return L2D_THINK;
+    default:               return L2D_IDLE;
+    }
+}
+
+// 播放一个 AnimState 对应的片段，并按好感解锁状态兜底：
+// 未解锁的"开心"不播，退回当前片段，避免低好感就看到解锁后的动作。
+static void L2dPlayState(AnimState s) {
+    int slot = L2dSlotForState(s);
+    if (!L2dSlotUnlocked(slot)) return;
+    L2dPlayClip(slot);
+}
+#endif
+
 // 对话好感度：由模型返回的增减值驱动，是养成的决定性指标。
 // 负分只压心情（影响爱心显示），不动 affinityTotal ——
 // 累计值只增，解锁永不回退，爱心也不会被扣空。
@@ -1074,6 +2425,9 @@ static void DrawHeartLiquid(Graphics& g, float cx, float cy, float w, float h, f
 
 static HWND g_hToast = nullptr;
 static int  g_toastBit = -1;
+// 主动搭话气泡"可点击展开对话"：g_toastClickable 为真时
+//   气泡窗口去掉 WS_EX_TRANSPARENT（可点），点一下就打开聊天窗定位到该条。
+static bool g_toastClickable = false;
 // ★ 通用气泡内容：成就只是其中一种，养成解锁也复用同一个气泡窗口
 static std::wstring g_toastIcon, g_toastTitle, g_toastDesc;
 static int  g_toastAlpha = 0;
@@ -1084,8 +2438,58 @@ static int  g_toastQHead = 0, g_toastQTail = 0;
 static HDC     g_toastDC = nullptr;
 static HBITMAP g_toastBmp = nullptr, g_toastOld = nullptr;
 
+// ==================================================================
+// 通用气泡队列：成就只是其中一类，错误/主动搭话（高优先级）
+//   与养成解锁（低优先级）可排队逐条展示，不再互相盖掉。
+//   每个气泡项可以是"直接文本"(icon/title/desc) 或"成就/解锁"(bit)。
+//   高优先级插到队首，低优先级排队尾；ToastTick 空闲时按序出队。
+// ==================================================================
+struct ToastItem {
+    int     bit = -1;          // >=0 表示成就/解锁项（走 ToastStart(bit)），-1 表示直接文本
+    wchar_t icon[24]  = { 0 };
+    wchar_t title[96] = { 0 };
+    wchar_t desc[160] = { 0 };
+    bool    clickable = false; // 可点击展开聊天窗（主动搭话气泡）
+};
+static std::deque<ToastItem> g_toastItems;   // 统一队列（高优先级 front）
+
+// 前置声明（定义在下方 ToastStart / ToastShowDirect）
+static void ToastStart(int bit);
+static void ToastShowDirect(const wchar_t* icon, const wchar_t* title, const wchar_t* desc, bool clickable = false);
+
+// 通用气泡入队：prio==0 高优先级（错误/主动搭话）插队首，1 低优先级（成就/解锁）排队尾
+static void ToastEnqueueMsg(const wchar_t* icon, const wchar_t* title, const wchar_t* desc, int prio, bool clickable = false) {
+    ToastItem m;
+    m.bit = -1;
+    m.clickable = clickable;
+    wcsncpy_s(m.icon, icon ? icon : L"", _TRUNCATE);
+    wcsncpy_s(m.title, title ? title : L"", _TRUNCATE);
+    wcsncpy_s(m.desc, desc ? desc : L"", _TRUNCATE);
+    if (prio == 0) g_toastItems.push_front(m);
+    else           g_toastItems.push_back(m);
+    if (g_toastItems.size() > 8) g_toastItems.pop_back();   // 限长，防堆积
+}
+// 成就/解锁入队（低优先级）：bit 形式，展示时由 ToastStart(bit) 填内容
+static void ToastEnqueueBit(int bit, int prio) {
+    ToastItem m; m.bit = bit;
+    if (prio == 0) g_toastItems.push_front(m);
+    else           g_toastItems.push_back(m);
+    if (g_toastItems.size() > 8) g_toastItems.pop_back();
+}
+
+// 兼容旧调用：成就位入队（低优先级）
 static void ToastEnqueue(int bit) {
-    if (g_toastQTail < ACH_COUNT) g_toastQueue[g_toastQTail++] = bit;
+    ToastEnqueueBit(bit, 1);
+}
+
+// 出队一项展示：bit>=0 走 ToastStart(bit)，否则直接文本（可带 U7 clickable）
+static bool ToastItemPop() {
+    if (g_toastItems.empty()) return false;
+    ToastItem it = g_toastItems.front();
+    g_toastItems.pop_front();
+    if (it.bit >= 0) ToastStart(it.bit);
+    else ToastShowDirect(it.icon, it.title, it.desc, it.clickable);
+    return true;
 }
 
 static void ToastPaint() {
@@ -1127,7 +2531,10 @@ static void ToastPaint() {
     g.DrawString(icon.c_str(), -1, &fIcon, iconR, &sf, &gold);
     RectF tR((float)pad + 58, (float)pad + 14, (float)(TOAST_W - 100), 22);
     g.DrawString(tname.c_str(), -1, &fTitle, tR, &sf, &white);
-    wchar_t line[80]; swprintf(line, 80, L"%s", tdesc.c_str());
+    // ★安全：swprintf 溢出时返回 -1 且不保证以 NUL 结尾，后续 DrawString(-1) 会越界读。
+    //   用 _TRUNCATE 版本，任何长度都保证终止。
+    wchar_t line[80];
+    _snwprintf_s(line, 80, _TRUNCATE, L"%s", tdesc.c_str());
     RectF dR((float)pad + 58, (float)pad + 38, (float)(TOAST_W - 80), 20);
     g.DrawString(line, -1, &fDesc, dR, &sf, &gray);
 
@@ -1147,23 +2554,29 @@ static void ToastDestroy() {
         g_toastDC = nullptr; g_toastBmp = nullptr;
     }
     g_toastBit = -1; g_toastAlpha = 0; g_toastPhase = 0; g_toastTick = 0;
+    g_toastClickable = false;
 }
 
-// 通用气泡：任意 icon/标题/描述都能弹
-static void ToastShow(const wchar_t* icon, const wchar_t* title, const wchar_t* desc) {
+// 直接显示一条通用气泡（立即建窗 + 绘制）。拆出来供队列出队时调用。
+// clickable=true 时去掉 WS_EX_TRANSPARENT，气泡可点（点击展开聊天窗）。
+static void ToastShowDirect(const wchar_t* icon, const wchar_t* title, const wchar_t* desc, bool clickable) {
     if (g_hToast) ToastDestroy();
     g_toastIcon  = icon  ? icon  : L"";
     g_toastTitle = title ? title : L"";
     g_toastDesc  = desc  ? desc  : L"";
+    g_toastClickable = clickable;
     // g_toastBit 兼作"气泡是否在展示"的哨兵，必须 >= 0，否则 ToastTick 会直接返回；
     // 内容一律读 g_toastIcon/Title/Desc，不再碰 ACH_DEF。
     g_toastBit = 0;
     g_toastAlpha = 0; g_toastPhase = 0; g_toastTick = 0;
-    g_toastQHead = g_toastQTail = 0;       // 解锁提示优先，清掉排队中的成就
-    g_hToast = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT,
+    DWORD exStyle = WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW;
+    if (!clickable) exStyle |= WS_EX_TRANSPARENT;
+    g_hToast = CreateWindowExW(exStyle,
         L"MakotoToast", L"", WS_POPUP, 0, 0, TOAST_W, TOAST_H, nullptr, nullptr,
         GetModuleHandleW(nullptr), nullptr);
-    if (!g_hToast) { g_toastBit = -1; return; }
+    // 建窗失败要一并清掉可点标志，避免残留的 g_toastClickable
+    //   让下一次普通气泡误触"点击展开"逻辑。
+    if (!g_hToast) { g_toastBit = -1; g_toastClickable = false; return; }
     RECT rc; GetWinRect(g_hwnd, rc);
     int x = GetSystemMetrics(SM_CXSCREEN) - TOAST_W - 20;
     int y = rc.top - TOAST_H - 12;
@@ -1171,6 +2584,18 @@ static void ToastShow(const wchar_t* icon, const wchar_t* title, const wchar_t* 
     SetWindowPos(g_hToast, HWND_TOPMOST, x, y, TOAST_W, TOAST_H, SWP_NOACTIVATE);
     ShowWindow(g_hToast, SW_SHOWNA);
     ToastPaint();
+}
+
+// 通用气泡：入队（默认低优先级），由 ToastTick 逐条展示，不再互相盖掉。
+// 高优先级（错误/主动搭话）请直接调 ToastEnqueueMsg(..., prio=0)。
+static void ToastShow(const wchar_t* icon, const wchar_t* title, const wchar_t* desc) {
+    ToastEnqueueMsg(icon, title, desc, 1);
+}
+// 高优先级版：插队首。若此刻没有气泡在展示（g_toastBit<0）则立即弹，
+// 否则排队首等当前气泡淡出后无缝衔接。
+static void ToastShowHi(const wchar_t* icon, const wchar_t* title, const wchar_t* desc) {
+    ToastEnqueueMsg(icon, title, desc, 0);
+    if (g_toastBit < 0) ToastItemPop();   // 空闲则立即出队展示
 }
 
 static void ToastStart(int bit) {
@@ -1204,9 +2629,12 @@ static void ToastStart(int bit) {
 }
 
 // 由主窗口 WM_TIMER 每帧推进（30fps）
+// 气泡队列：空闲时按序出队（高优先级 front 先展示），逐条不再互相盖掉。
 static void ToastTick() {
     if (g_toastBit < 0) {
-        if (g_toastQHead < g_toastQTail) ToastStart(g_toastQueue[g_toastQHead++]);
+        if (!g_toastItems.empty()) { ToastItemPop(); return; }
+        // 兼容旧的成就位队列（保留路径）
+        if (g_toastQHead < g_toastQTail) { ToastStart(g_toastQueue[g_toastQHead++]); return; }
         return;
     }
     g_toastTick++;
@@ -1507,7 +2935,29 @@ static void OpenAchPanel() {
 }
 
 // 气泡窗口过程（空实现即可，不需要交互）
+// 前置声明（定义在后）：点击展开 -> 打开聊天窗
+#define WM_LOCATE_PROACTIVE (WM_USER + 104)   // 点击主动搭话气泡：滚到该条历史
+static void OpenChatDialog();
+static HWND g_hChatWnd = nullptr;   // 定义上移（原在 LLM 对话区），供气泡点击定位使用
+
 static LRESULT CALLBACK ToastProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_LBUTTONDOWN) {
+        // 点击"茉子·xxx"的主动搭话气泡 -> 展开聊天窗并滚到该条历史
+        if (g_toastClickable) {
+            g_toastClickable = false;
+            ToastDestroy();
+            OpenChatDialog();
+            // OpenChatDialog 同步创建窗口并载入历史；随后异步定位，
+            //   确保历史文本已就绪再滚动（PostMessage 排在当前消息之后）。
+            if (g_hChatWnd && IsWindow(g_hChatWnd))
+                PostMessageW(g_hChatWnd, WM_LOCATE_PROACTIVE, 0, 0);
+            return 0;
+        }
+        return 0;
+    }
+    if (msg == WM_SETCURSOR) {
+        if (g_toastClickable) SetCursor(LoadCursorW(nullptr, IDC_HAND));
+    }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
@@ -1793,6 +3243,46 @@ static std::vector<std::wstring> ScanAnimFiles(Costume costume, AnimState state)
     return out;
 }
 
+// ==================================================================
+//  ★ 素材扫描：启动时（以及每次打开右键菜单时）各扫一次两套素材。
+//  只做"存在性"判断，不解码、不加载 —— 16 次 FindFirstFile + 几个 PathFileExists，
+//  放在菜单弹出前做也没有感知延迟。
+// ==================================================================
+static bool DetectFrameAssets() {
+    for (int c = 0; c < 4; ++c)
+        for (int s = 0; s < 4; ++s)
+            if (!ScanAnimFiles((Costume)c, (AnimState)s).empty()) return true;
+    return false;
+}
+
+static bool DetectLive2DAssets() {
+#if USE_LIVE2D
+    // 运行时 DLL 缺了，模型再多也跑不起来
+    if (!PathFileExistsW(L"p2l_runtime.dll")) return false;
+    for (int i = 0; i < 4; ++i) {
+        std::string pn = kL2dModelName[i];
+        // 新结构（8 表情独立 rig） / 旧结构（单文件，物理版优先）
+        std::string pNew = "live2d/" + pn + "/base.p2lrt";
+        std::string pPhy = "live2d/" + pn + "_physics.p2lrt";
+        std::string pOld = "live2d/" + pn + ".p2lrt";
+        if (PathFileExistsA(pNew.c_str()) || PathFileExistsA(pPhy.c_str())
+            || PathFileExistsA(pOld.c_str())) return true;
+    }
+    // 兜底：旧版直接放 exe 同级的单模型
+    return PathFileExistsA("mako.p2lrt") || PathFileExistsA("tml.p2lrt");
+#else
+    return false;
+#endif
+}
+
+// 刷新两个标志位（工作目录已由 WinMain 设为 exe 所在目录）
+static void DetectAssets() {
+    g_hasFrameAssets  = DetectFrameAssets();
+    g_hasLive2DAssets = DetectLive2DAssets();
+    PetDbgA(g_hasFrameAssets ? "[Assets] frames ok\n" : "[Assets] no frames\n");
+    PetDbgA(g_hasLive2DAssets ? "[Assets] live2d ok\n" : "[Assets] no live2d\n");
+}
+
 static std::recursive_mutex     g_frameMtx;
 static std::recursive_mutex     g_renderMtx;
 static volatile bool            g_renderPrewarmReq = false;
@@ -1818,10 +3308,48 @@ static std::vector<Image*>& GetFramesCached(Costume costume, AnimState state);  
 
 void SwitchAnim(Costume costume, AnimState state) {
     if (state != g_currentState) PlayPoseSFX(state);
+#if USE_LIVE2D
+    // ★ 按服装粒度的自动升级 / 降级：换装时只要运行时 DLL 就绪，就先尝试为
+    //   目标服装加载模型。条件用 g_l2dLibReady 而不是 Live2DReady()，这样
+    //   从「无模型的序列帧服装」换到「有模型的服装」也能自动升级回 Live2D。
+    //   ★ 但必须尊重用户选定的渲染方式：菜单里选了「序列帧」之后，
+    //     换装不能再偷偷把模型加载回来（DLL 仍常驻，所以还要看 g_renderMode）。
+    if (g_l2dLibReady && g_renderMode == RM_LIVE2D && costume != g_currentCostume) {
+        if (Live2DOpenRig(costume, false, false)) {
+            // 模型可用：Live2D 同步热切换（没有换图淡入淡出，避免 g_currentCostume
+            // 卡住导致菜单勾选不变、存档不更新、好感度反复 +1）。
+            g_currentCostume = costume;
+            g_currentState = state;
+            g_currentFrameIndex = 0;
+            g_idleActionTimer = 0;
+            g_isRandomAction = false;
+            g_bTransitioning = false;
+            g_pendingCostume = costume;
+            g_renderPrewarmReq = true;
+            PlayCostumeChangeSFX();
+            StatsAddAffinity(1);
+            SaveConfig();                     // 立刻记住，强杀进程也不丢
+            return;
+        }
+        // 目标服装没有可用模型 → 降级为序列帧。必须先释放当前 rig，让
+        // Live2DReady() 变 false，否则 WM_TIMER 里的 g_bTransitioning 交接
+        // 分支会被挡住、画面卡在旧服装；同时丢弃残留的过渡态。
+        if (g_l2dRig) Live2DReleaseRig();
+        g_bTransitioning = false;
+        // 若启动时因「当前服装有模型」跳过了序列帧预加载，这里补启动，
+        // 否则降级后帧缓存为空会全黑。AnimLoadStart 幂等，重复调用无副作用。
+        AnimLoadStart();
+        // 继续落到下面，按普通序列帧换装流程切换到目标服装。
+    }
+#endif
     if (costume == g_currentCostume) {
         g_currentFrameIndex = 0;
         g_currentState = state;
         g_currentCostume = costume;
+#if USE_LIVE2D
+        // Live2D 下状态切换同时驱动片段播放；序列帧路径继续用帧缓存，两条路互不干扰。
+        if (Live2DReady()) L2dPlayState(state);
+#endif
         // ★ 取自帧缓存：缓存独占这些 Image，这里绝不能 ClearFrames(g_currentFrames)
         g_currentFrames = GetFramesCached(costume, state);
         g_idleActionTimer = 0;
@@ -1841,9 +3369,8 @@ void SwitchAnim(Costume costume, AnimState state) {
 
 // ==================================================================
 //  ★ 帧缓存（性能核心 1）：避免每次切换动作都重新解码整套 PNG
-//  原来切换服装 / 开始拖拽都要重新：扫描目录 → 解码 8~10 张 PNG，
-//  统一走一次就要几百毫秒，这就是"切换动作、开始拖拽时卡顿"的根因。
-//  素材运行期不会变，所以每套动画只解码一次，之后常驻复用。
+//  素材运行期不变，每套动画只解码一次并常驻复用；
+//  否则每次切换服装 / 开始拖拽都要重新扫描目录、解码 8~10 张 PNG，造成明显卡顿。
 // ==================================================================
 static std::vector<Image*> g_frameCache[4][4];
 static bool                g_frameCached[4][4] = {};
@@ -1916,6 +3443,7 @@ static void RenderCacheInvalidate(int ci, int si);
 
 static std::vector<Image*> g_pendingDelete;
 static volatile bool g_preloadDone = false;
+static bool          g_bootDone    = false;   // 启动收尾（BGM/启动音）只做一次
 static volatile int  g_preloadProgress = 0;   // 0..16，启动时托盘提示用
 
 // 装载一套：解码全部帧 + 预构建本套的渲染缓存
@@ -2011,8 +3539,9 @@ static unsigned __stdcall AnimLoadProc(void*) {
 }
 
 static void AnimLoadStart() {
-    if (!g_hLoadThread)
-        g_hLoadThread = (HANDLE)_beginthreadex(nullptr, 0, AnimLoadProc, nullptr, 0, nullptr);
+    if (g_hLoadThread) return;
+    g_loadQuit = false;      // ★ 从 Live2D 切回序列帧时复用同一入口，得先把停止标志清掉
+    g_hLoadThread = (HANDLE)_beginthreadex(nullptr, 0, AnimLoadProc, nullptr, 0, nullptr);
 }
 
 static void AnimLoadStop() {
@@ -2042,9 +3571,8 @@ static bool CalcDrawRectFit(int w, int h, int imgW, int imgH, int& drawX, int& d
 
 // ==================================================================
 //  ★ 预缩放渲染缓存（性能核心 2）
-//  原来每秒 30 帧，每帧都要把 800~1100px 高的原图交给 GDI+ 缩放到窗口尺寸。
-//  缩放是纯 CPU 重采样，占了绘制耗时的绝大部分，而且每帧重复做同一件事。
-//  这里预先缩放好存起来，之后每帧只剩一次 1:1 拷贝。
+//  GDI+ 缩放是纯 CPU 重采样，占绘制耗时的大头。
+//  预先缩放到窗口尺寸并缓存，之后每帧只剩一次 1:1 拷贝。
 //  构建是【逐帧懒加载】：帧序号每帧前进一格，所以最多每帧新建 1 张，
 //  不会像"切换时一次性缩放整套"那样造成明显顿挫。
 // ==================================================================
@@ -2195,13 +3723,36 @@ void UpdateLayered() {
             DeleteObject(g_hMemBmp);
             DeleteDC(g_memDC);
             g_memDC = nullptr; g_hMemBmp = nullptr; g_hOldBmp = nullptr;
+            g_dibBits = nullptr;
         }
         HDC screenDC = GetDC(nullptr);
         if (!screenDC) return;
         g_memDC = CreateCompatibleDC(screenDC);
+#if USE_LIVE2D
+        // 32bpp top-down DIB：拿到可直写的像素指针，行序与 p2l_render 一致。
+        // ULW_ALPHA 要求位图自带 alpha 通道，CreateCompatibleBitmap 做不到。
+        if (g_memDC) {
+            BITMAPINFO bi{};
+            bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+            bi.bmiHeader.biWidth = w;
+            bi.bmiHeader.biHeight = -h;          // 负高度 = top-down
+            bi.bmiHeader.biPlanes = 1;
+            bi.bmiHeader.biBitCount = 32;
+            bi.bmiHeader.biCompression = BI_RGB;
+            void* bits = nullptr;
+            g_hMemBmp = CreateDIBSection(screenDC, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+            g_dibBits = (uint8_t*)bits;
+        }
+#else
         g_hMemBmp = CreateCompatibleBitmap(screenDC, w, h);
+#endif
         ReleaseDC(nullptr, screenDC);
         if (!g_memDC || !g_hMemBmp) return;
+#if USE_LIVE2D
+        if (!g_dibBits) return;
+        g_l2dFrameDirty = true;      // 输出尺寸变了，缓存帧作废
+        g_l2dRgba.clear();
+#endif
         g_hOldBmp = (HBITMAP)SelectObject(g_memDC, g_hMemBmp);
         g_cachedW = w; g_cachedH = h;
         g_gfx = new Graphics(g_memDC);
@@ -2218,6 +3769,12 @@ void UpdateLayered() {
     Graphics& g = *g_gfx;
 
     g.Clear(Color(0, 0, 0, 0));
+#if USE_LIVE2D
+    if (Live2DReady() && g_preloadDone) {
+        // 直接写 DIB 像素，不经 GDI+ 缩放：网格是实时变形的，任意尺寸都不糊。
+        Live2DBlit(w, h);
+    } else
+#endif
     if (!g_preloadDone) {
         DrawLoading(g, w, h);
     } else if (g_bTransitioning && g_pTransitionImg) {
@@ -2320,6 +3877,12 @@ void UpdateLayered() {
     }
     SIZE size = { w, h };
     BLENDFUNCTION bf = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+#if USE_LIVE2D
+    if (Live2DReady()) {
+        Live2DPremultiply(w, h);     // 直通 alpha -> 预乘，ULW_ALPHA 的硬性要求
+        UpdateLayeredWindow(g_hwnd, nullptr, &ptWin, &size, g_memDC, &ptSrc, 0, &bf, ULW_ALPHA);
+    } else
+#endif
     UpdateLayeredWindow(g_hwnd, nullptr, &ptWin, &size, g_memDC, &ptSrc, RGB(0, 0, 0), &bf, ULW_COLORKEY);
     g_lastPaintMs = GetTickCount64();
 }
@@ -2360,23 +3923,223 @@ static void SetPetVisible(HWND hwnd, bool show) {
     }
 }
 
-// 拖拽落点限制在光标所在显示器内：否则能拖出屏幕，只能靠改 config.ini 救回来
+// 光标所在显示器的工作区底边（任务栏上沿）；多屏时跟着当前屏幕走。
+static int MonitorWorkBottom(POINT pt) {
+    HMONITOR hm = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi = { sizeof(mi) };
+    if (hm && GetMonitorInfoW(hm, &mi)) return mi.rcWork.bottom;
+    return GetSystemMetrics(SM_CYSCREEN);
+}
+
+// 拖拽落点限制在光标所在显示器内：左右/顶部仍只留 20% 探出余量；
+// 底部一路允许沉到「只露 HALF_BODY_VISIBLE 比例」——这就是纯拖拽的半身手势，
+// 不需要任何按钮。往上拖则自然回到全身区域。
 static void ClampToMonitor(POINT pt, int w, int h, int& outX, int& outY) {
     HMONITOR hm = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
     MONITORINFO mi = { sizeof(mi) };
+    int overW = (int)(w * 0.20f), overH = (int)(h * 0.20f);
+    int overBottom = (int)(h * (1.0f - HALF_BODY_VISIBLE)) + 4;
     if (hm && GetMonitorInfoW(hm, &mi)) {
-        int L = mi.rcWork.left, T = mi.rcWork.top;
-        int R = mi.rcWork.right - w,  B = mi.rcWork.bottom - h;
+        int L = mi.rcWork.left - overW, T = mi.rcWork.top - overH;
+        int R = mi.rcWork.right - w + overW, B = mi.rcWork.bottom - h + overBottom;
         if (R < L) R = L;
         if (B < T) B = T;
         if (outX < L) outX = L; if (outX > R) outX = R;
         if (outY < T) outY = T; if (outY > B) outY = B;
     } else {
-        int sw = GetSystemMetrics(SM_CXSCREEN) - w;
-        int sh = GetSystemMetrics(SM_CYSCREEN) - h;
-        if (outX < 0) outX = 0; if (outX > sw) outX = sw;
-        if (outY < 0) outY = 0; if (outY > sh) outY = sh;
+        int sw = GetSystemMetrics(SM_CXSCREEN) - w + overW;
+        int sh = GetSystemMetrics(SM_CYSCREEN) - h + overBottom;
+        if (outX < -overW) outX = -overW; if (outX > sw) outX = sw;
+        if (outY < -overH) outY = -overH; if (outY > sh) outY = sh;
     }
+}
+
+// 半身状态完全由窗口位置推导：底边探出工作区超过普通上限就算半身。
+static bool IsHalfBodyPlacement(int top, int h, POINT anchor) {
+    if (h <= 0) return false;
+    return (top + h - MonitorWorkBottom(anchor)) > (int)(h * HALF_BODY_FULL_LIMIT);
+}
+
+static void RefreshHalfBodyFromPlacement(int top, int h, POINT anchor) {
+    bool want = IsHalfBodyPlacement(top, h, anchor);
+    if (want != g_halfBody) g_halfBody = want;   // 位置才是唯一真相，不写额外开关
+}
+
+static void RefreshHalfBodyFromWindow() {
+    RECT rc{};
+    if (!g_hwnd || !IsWindow(g_hwnd) || !GetWindowRect(g_hwnd, &rc)) return;
+    int h = rc.bottom - rc.top;
+    if (h <= 0) h = g_currentH;
+    POINT anchor{ (rc.left + rc.right) / 2, rc.bottom };
+    RefreshHalfBodyFromPlacement(rc.top, h, anchor);
+}
+
+// 松手时若已经越过半身阈值但还没沉到底，就一次性吸附到标准半身位置；
+// 这样玩家只要"往下拖一把"，不必把鼠标精确拖到屏幕最底边。
+static void SnapHalfBodyOnDragEnd(POINT cursor, int& outY) {
+    int h = g_currentH;
+    if (h <= 0) return;
+    int workBottom = MonitorWorkBottom(cursor);
+    int over = outY + h - workBottom;
+    int fullLimit = (int)(h * HALF_BODY_FULL_LIMIT);
+    int maxOver = (int)(h * (1.0f - HALF_BODY_VISIBLE)) + 4;
+    if (over > fullLimit && over < maxOver) outY = workBottom + maxOver - h;
+}
+
+#if USE_LIVE2D
+// 按当前服装的人物宽高比重算窗口尺寸：固定比例（2:3）会裁掉全身立绘，
+// 约 1:3.5，等比缩进去后左右空出一大片透明矩形 —— 既挡桌面点击，又让
+// ClampToMonitor 拿这个大矩形去限制拖动范围。这里让窗口贴着人物收紧。
+static void Live2DApplyWindowSize() {
+    if (!g_l2dRig || !g_hwnd) return;
+    float aspect = (g_l2dContent.ok && g_l2dContent.h > 0.0f)
+        ? g_l2dContent.w / g_l2dContent.h : (float)BASE_W / (float)BASE_H;
+    if (aspect < 0.12f) aspect = 0.12f;
+    if (aspect > 0.75f) aspect = 0.75f;
+    // ★ 高度优先用存档里的 WinH（g_restoreWinH），只取一次；
+    //   没有存档时才按 g_zoom 推算；一律用 g_zoom 会导致重开程序
+    //   就把上次的窗口高度丢掉了。
+    int winH = (g_restoreWinH > 0) ? g_restoreWinH : (int)(BASE_H * g_zoom);
+    g_restoreWinH = 0;
+    // FIT_W == FIT_H 时窗口宽高比就是人物宽高比；1.06 是左右各留 3% 的摆动余量。
+    int winW = (int)(winH * aspect * (L2D_FIT_H / L2D_FIT_W) * 1.06f);
+    if (winW < 64) winW = 64;
+    if (winW > (int)(BASE_W * 3.0f)) winW = (int)(BASE_W * 3.0f);
+    if (winH < 90) winH = 90;
+    if (winH > (int)(BASE_H * 3.0f)) winH = (int)(BASE_H * 3.0f);
+    // 把实际高度同步回缩放尺度，滚轮缩放才能从当前大小继续加减
+    {
+        float z = (float)winH / (float)BASE_H;
+        if (z < 0.5f) z = 0.5f;
+        if (z > 3.0f) z = 3.0f;
+        g_zoom = z;
+    }
+
+    RECT rc;
+    if (!GetWindowRect(g_hwnd, &rc)) return;
+    int cx = (rc.left + rc.right) / 2;
+    int bottom = rc.bottom;
+    int nx = cx - winW / 2, ny = bottom - winH;   // 以中心 + 底边为锚
+    POINT anchor = { cx, bottom };
+    ClampToMonitor(anchor, winW, winH, nx, ny);
+    SetWindowPos(g_hwnd, HWND_TOPMOST, nx, ny, winW, winH, SWP_NOACTIVATE);
+    g_currentW = winW; g_currentH = winH;
+    g_winX = nx; g_winY = ny; g_winPosKnown = true;
+    g_l2dFrameDirty = true;    // 输出尺寸变了，缓存帧作废
+    RefreshHalfBodyFromPlacement(ny, winH, anchor);   // 尺寸变了，按新位置重算半身状态
+}
+
+// ★ 模型加载完才知道窗口的真实尺寸，这里把存档里的坐标与尺寸精确贴一次。
+//   否则 Live2DApplyWindowSize 的"底边锚定"重算会在高度变化时把窗口位置拽偏，
+//   用户看到的就是"位置没记住"。
+static void RestoreSavedGeometry() {
+    if (!g_hwnd || !IsWindow(g_hwnd)) return;
+    if (!g_hasSavedPos) return;
+    int w = g_currentW, h = g_currentH;
+    if (w < 64) w = 64;
+    if (h < 90) h = 90;
+    int nx = g_savedPosX, ny = g_savedPosY;
+    POINT anchor = { nx + w / 2, ny + h / 2 };
+    ClampToMonitor(anchor, w, h, nx, ny);   // 换过显示器 / 改过分辨率也不会跑到屏幕外
+    SetWindowPos(g_hwnd, HWND_TOPMOST, nx, ny, w, h, SWP_NOACTIVATE);
+    g_winX = nx; g_winY = ny; g_winPosKnown = true;
+    g_l2dFrameDirty = true;
+}
+#endif
+
+// ==================================================================
+//  ★ 渲染方式切换（右键菜单：序列帧 / Live2D）
+//  两条路各自的"进入 / 退出"动作都收口在这里，菜单里只负责发指令。
+// ==================================================================
+// 序列帧窗口是固定 2:3（BASE_W : BASE_H × zoom）；Live2D 会把它收窄到人物宽度。
+// 所以从模型切回序列帧时必须把宽度还原，否则人物会被窗口左右裁掉一截。
+static void ApplyFrameWindowSize() {
+    int w = (int)(BASE_W * g_zoom), h = (int)(BASE_H * g_zoom);
+    if (w < 64) w = 64;
+    if (h < 90) h = 90;
+    RECT rc{};
+    if (g_hwnd && IsWindow(g_hwnd) && GetWindowRect(g_hwnd, &rc)) {
+        int cx = (rc.left + rc.right) / 2, bottom = rc.bottom;
+        int nx = cx - w / 2, ny = bottom - h;      // 与 Live2D 相同的"中心 + 底边"锚点
+        POINT anchor = { cx, bottom };
+        ClampToMonitor(anchor, w, h, nx, ny);
+        SetWindowPos(g_hwnd, HWND_TOPMOST, nx, ny, w, h, SWP_NOACTIVATE);
+        g_winX = nx; g_winY = ny; g_winPosKnown = true;
+    }
+    g_currentW = w; g_currentH = h;
+    RenderCacheInvalidate();      // 输出尺寸变了，预缩放缓存全部作废
+    MarkGeomDirty();
+    RefreshHalfBodyFromWindow();   // 尺寸变了，按新位置重算半身状态
+}
+
+// 返回是否切换成功；失败时保持原来的渲染方式，界面和存档都不动。
+static bool SetRenderMode(RenderMode m) {
+    // "目标已达成"就不折腾。Live2D 还要看 rig 在不在：某套服装没有模型时会被
+    // 自动降级成序列帧，此时 g_renderMode 仍是 Live2D，但画面是帧——必须允许重试。
+    if (m == RM_FRAMES  && g_renderMode == RM_FRAMES  && !Live2DReady()) return true;
+    if (m == RM_LIVE2D  && g_renderMode == RM_LIVE2D  &&  Live2DReady()) return true;
+
+    if (m == RM_LIVE2D) {
+#if USE_LIVE2D
+        if (!g_hasLive2DAssets) {
+            ToastShow(L"🖼", L"没有 Live2D 素材",
+                L"把 p2l_runtime.dll 放到 exe 同级、模型放进 live2d\\ 文件夹后再试。");
+            return false;
+        }
+        if (!g_l2dLibReady) {
+            Live2DInit();                 // 第一次切到模型：装载运行时 DLL（内部也会试开当前服装）
+            if (!g_l2dLibReady) {
+                ToastShow(L"🖼", L"Live2D 运行时不可用",
+                    L"p2l_runtime.dll 加载失败或版本过旧，详见 DebugView 里的 [MakotoPet]。");
+                return false;
+            }
+        }
+        if (!Live2DReady() && !Live2DOpenRig(g_currentCostume, false, true)) {
+            ToastShow(L"🖼", L"这套服装没有可用模型",
+                g_l2dLastError.empty() ? L"live2d\\ 下找不到对应模型的 .p2lrt。" : g_l2dLastError.c_str());
+            return false;
+        }
+        g_bTransitioning = false;
+        g_renderMode = RM_LIVE2D;
+        AnimLoadStop();               // 停掉后台预解码；已解出的帧保留着，切回来秒开
+        Live2DApplyWindowSize();      // 宽度收窄到人物比例
+        L2dPlayState(g_currentState);
+        g_preloadDone = true;
+        SaveConfig();
+        RequestPaint(true);
+        return true;
+#else
+        ToastShow(L"🖼", L"这个版本没有编译 Live2D", L"请用 USE_LIVE2D=1 重新编译后再试。");
+        return false;
+#endif
+    }
+
+    // → 序列帧
+    bool haveFrames = g_hasFrameAssets;
+    if (!haveFrames) {
+        // 素材目录被移走、但这一套已经解码在内存里：仍然允许切过去
+        std::lock_guard<std::recursive_mutex> lk(g_frameMtx);
+        int ci = (int)g_currentCostume, si = (int)g_currentState;
+        if (ci >= 0 && ci < 4 && si >= 0 && si < 4)
+            haveFrames = g_frameCached[ci][si] && !g_frameCache[ci][si].empty();
+    }
+    if (!haveFrames) {
+        ToastShow(L"🖼", L"没有序列帧素材",
+            L"把 PNG 放进 Animations\\服装\\动作\\ 后再试（目录结构见 README）。");
+        return false;
+    }
+#if USE_LIVE2D
+    if (g_l2dRig) Live2DReleaseRig();   // 只放 rig，DLL 留着，切回去不用重新加载
+#endif
+    g_bTransitioning = false;
+    g_renderMode = RM_FRAMES;
+    ApplyFrameWindowSize();
+    AnimLoadStart();                    // 幂等：线程还在就直接复用
+    SwitchAnim(g_currentCostume, AnimState::Idle);   // 缓存里没有就当场解码这一套
+    g_preloadDone = true;
+    SaveConfig();
+    RequestPaint(true);
+    return true;
 }
 
 // ==================== LLM 对话系统 ====================
@@ -2384,15 +4147,52 @@ static void ClampToMonitor(POINT pt, int w, int h, int& outX, int& outY) {
 #define WM_APPEND_CHAR      (WM_USER + 102)
 #define WM_STREAM_DONE      (WM_USER + 101)
 #define WM_REMOVE_THINKING  (WM_USER + 103)
+#define WM_APP_ASR_DONE     (WM_USER + 105)   // ★语音：whisper 转写完成，lParam = new std::wstring
 
 static const int TYPEWRITER_DELAY_MS = 30;
 static bool g_lastJsonTruncated = false;   // 本次回复是否被 max_tokens 截断
-static HWND g_hChatWnd = nullptr;
 static HWND g_hHistoryEdit = nullptr;
 static HWND g_hInputEdit = nullptr;
 static HWND g_hSendBtn = nullptr;
+static HWND g_hStatusLabel = nullptr;      // 底部状态栏（"茉子正在思考…"动态省略号）
+static HWND g_hAttachStrip = nullptr;      // ★附件条子窗口（有附件才显示）
 static bool g_isChatting = false;
 static bool g_richEditLoaded = false;
+static volatile bool g_typewriting = false; // 打字机进行中（点击/任意键跳过）
+static std::atomic<bool> g_typewriterSkip{ false }; // 跳过信号：LLM 线程下次循环检查后立即灌全文
+static int g_chatTheme = 0;                // ★主题缓存（0浅/1深）：上色函数直接读它，避免每段查 ini
+
+// ★危险操作二次确认（清空对话 / 清空长期记忆）：
+//   第一次点击只"上膛"并把按钮改成确认态，5 秒内再点一次才真正删除。
+//   记忆、对话记录属于不可恢复数据，误点一下全丢对玩家来说代价太大。
+static int       g_confirmAction = 0;      // 0=无 1=清空对话 2=清空记忆
+static ULONGLONG g_confirmUntil  = 0;      // 上膛失效时刻（GetTickCount64 毫秒）
+#define CONFIRM_WINDOW_MS 5000
+
+// 聊天窗顶栏控件 ID
+#define ID_BTN_CLEAR    105
+#define ID_BTN_MEMORY   106
+#define ID_BTN_LONGFORM 107
+#define ID_BTN_THEME    108        // ★主题切换（浅/深）按钮
+#define ID_BTN_ATTACH   109        // ★附件：📎 选文件
+#define ID_BTN_MIC      110        // ★附件：🎤 语音输入
+#define ID_ATTACH_STRIP 4001       // ★附件条子窗口
+#define ATTACH_STRIP_H  56
+#define ID_TIMER_STATUS 901        // 状态栏动画定时器
+
+// 前置声明（定义在 ChatWndProc 之后）
+static void SubmitChat(HWND hwnd);
+static void ClearChatHistory();
+static void ClearMemoryFile();     // ★危险操作：清空 memory.txt（调用前必须二次确认）
+static void OpenMemoryFile();
+static void ArmDangerousAction(HWND hwnd, int action);   // ★上膛：按钮切到确认态
+static void SetLLMConfigInt(const wchar_t* key, int val, int lo, int hi);
+static void SetUIConfigInt(const wchar_t* key, int val, int lo, int hi);   // ★主题/打字机开关写回 [UI]
+static void SetButtonText(HWND hwnd, int id, const wchar_t* text);
+static void ShowTypewriterSkipHint();
+static void OpenSettingsDialog();   // ★设置面板：覆盖所有玩家可配参数
+static void ToggleVoiceRecord(HWND hwnd);   // ★附件/语音：🎤 开始/结束录音（实现在附件对话区）
+static void VoiceAbortRecording();          // 关窗/退出时强制停止录音
 
 #include <string>
 std::wstring g_ttsRefAudioPath; // 全局变量，用来存运行时的绝对路径
@@ -2405,13 +4205,28 @@ static const wchar_t* TTS_REF_TEXT = L"常陸茉子です、よろしくお願�
 
 // ==================== TTS 配置（[TTS] 段） ====================
 // 端口/路径随 GPT-SoVITS 版本而变，写死容易"换个整合包就哑了"，全部可配。
+// 不能用 GetPrivateProfileStringW(..., nullptr, 0, ...) 先探长度：
+// 该调用在本机一律返回 0（不返回实际长度），旧实现因此把所有字符串配置都读成空，
+// 表现为 ApiUrl / ApiKey 丢失。改为"给足缓冲后再按返回值扩容"：
+// 返回值是实际写入的字符数（不含结尾 NUL）；只有 got == cap-1 才说明可能被截断。
+static std::wstring ReadIniStringDyn(const wchar_t* sec, const wchar_t* key,
+                                     const wchar_t* defVal, const std::wstring& iniPath) {
+    const wchar_t* fallback = defVal ? defVal : L"";
+    size_t cap = 256;
+    for (;;) {
+        std::vector<wchar_t> buf(cap, L'\0');
+        DWORD got = GetPrivateProfileStringW(sec, key, fallback, buf.data(), (DWORD)buf.size(), iniPath.c_str());
+        if (got == 0) return fallback;                 // 键不存在且默认值为空
+        if (got < cap - 1) return std::wstring(buf.data(), got);  // 完整读到
+        if (cap >= (1u << 20)) return std::wstring(buf.data(), got);  // 1MB 上限，防异常 ini
+        cap *= 2;
+    }
+}
 static std::wstring GetIniStr(const wchar_t* sec, const wchar_t* key, const wchar_t* defVal) {
     std::wstring exeDir;
     if (!GetExeDir(exeDir)) return defVal;
     std::wstring iniPath = exeDir + L"\\llm.ini";
-    std::vector<wchar_t> buf(1024, L'\0');
-    GetPrivateProfileStringW(sec, key, defVal, buf.data(), (DWORD)buf.size(), iniPath.c_str());
-    return std::wstring(buf.data());
+    return ReadIniStringDyn(sec, key, defVal, iniPath);
 }
 static int GetIniInt(const wchar_t* sec, const wchar_t* key, int defVal, int lo, int hi) {
     std::wstring v = GetIniStr(sec, key, L"");
@@ -2600,6 +4415,111 @@ static int ExtractJsonInt(const std::string& json, const std::string& key, int d
     return out;
 }
 
+// 取 JSON 里的浮点（如 intensity 0..1）。支持 0.8 / "0.8" / 1，容错同 ExtractJsonInt。
+static float ExtractJsonFloat(const std::string& json, const std::string& key, float defVal, float lo, float hi) {
+    std::string searchKey = "\"" + key + "\":";
+    size_t pos = json.find(searchKey);
+    if (pos == std::string::npos) return defVal;
+    pos += searchKey.length();
+    while (pos < json.length() && (json[pos] == ' ' || json[pos] == '\t' || json[pos] == '\n' || json[pos] == '\r')) pos++;
+    bool quoted = (pos < json.length() && json[pos] == '"');
+    if (quoted) pos++;
+    bool neg = false;
+    if (pos < json.length() && (json[pos] == '-' || json[pos] == '+')) { neg = (json[pos] == '-'); pos++; }
+    if (pos >= json.length() || json[pos] < '0' || json[pos] > '9') return defVal;   // 只接受以数字开头
+    double v = 0.0;
+    while (pos < json.length() && json[pos] >= '0' && json[pos] <= '9') { v = v * 10 + (json[pos] - '0'); pos++; }
+    if (pos < json.length() && json[pos] == '.') {
+        pos++; double frac = 0.1;
+        while (pos < json.length() && json[pos] >= '0' && json[pos] <= '9') { v += (json[pos] - '0') * frac; frac *= 0.1; pos++; }
+    }
+    if (neg) v = -v;
+    float out = (float)v;
+    if (out < lo) out = lo;
+    if (out > hi) out = hi;
+    return out;
+}
+
+// ==================================================================
+// JSON 字段归一化：模型偶尔把字段名写成中文/大小写不一致/别名
+// （zh / 中文 / reply / content / text …），逐个 try 容易漏，故统一归一化。
+// 这里做"一次归一化"：把 JSON 对象的 key 统一映射到约定字段再取。
+// ==================================================================
+// 带别名的字符串提取：按 aliases 顺序找第一个非空值。
+static std::string ExtractJsonStringAny(const std::string& json, const std::vector<std::string>& aliases) {
+    for (const auto& a : aliases) {
+        std::string v = ExtractJsonString(json, a);
+        if (!v.empty()) return v;
+    }
+    return "";
+}
+// 好感度等"数字字段"走整数提取，不用 ExtractJsonStringAny。
+//   ExtractJsonString 只认带引号的字符串，模型正常输出 "affection": 2（数字字面量）时
+//   会取到空串，导致 affDelta 永远停在默认 1、评分形同虚设。
+//   这里按别名表逐个尝试 ExtractJsonInt（它兼容 2 / "2" / 2.0 / 负数），
+//   用 found 标记区分"字段给了 0"和"字段缺失"两种情况。
+static int ExtractJsonIntAny(const std::string& json, const std::vector<std::string>& aliases,
+                             int defVal, int lo, int hi, bool* found = nullptr) {
+    if (found) *found = false;
+    for (const auto& a : aliases) {
+        // 先看字段在不在（带引号的 key 后面跟冒号），在才调用，避免把缺失字段误判成 0。
+        if (json.find("\"" + a + "\":") == std::string::npos &&
+            json.find("\"" + a + "\" :") == std::string::npos) continue;
+        int v = ExtractJsonInt(json, a, defVal, lo, hi);
+        if (found) *found = true;
+        return v;
+    }
+    return defVal;
+}
+// 字段归一化映射表（一次查全，避免散落各处）
+static std::vector<std::string> AliasZh() {
+    return { "zh", "中文", "cn", "chinese", "reply", "content", "text",
+             "回答", "回复", "中文回复" };
+}
+static std::vector<std::string> AliasJa() {
+    return { "ja", "日文", "日语", "jp", "japanese", "日语回复" };
+}
+static std::vector<std::string> AliasEmotion() {
+    return { "emotion", "情绪", "心情", "mood" };
+}
+static std::vector<std::string> AliasAffection() {
+    return { "affection", "好感", "好感度" };
+}
+static std::vector<std::string> AliasMemory() {
+    return { "memory", "记忆" };
+}
+
+// 把 LLM 的 action 字符串归类到动作槽：返回 -1 表示"没给/不覆盖"。
+// 只认约定词，避免模型自由发挥导致越界；与 L2dSlotForEmotion 的槽位定义一致。
+// 放在 #if 外，序列帧模式也能编译通过（不调用即可）。
+static int ParseDirectorAction(const std::string& raw) {
+    std::string s;
+    for (char c : raw) s += (char)tolower((unsigned char)c);
+    if (s.find("peace") != std::string::npos || s.find("happy") != std::string::npos ||
+        s.find("laugh") != std::string::npos || s.find("开心") != std::string::npos ||
+        s.find("笑") != std::string::npos) return 2;    // 开心摇摆
+    if (s.find("think") != std::string::npos || s.find("nod") != std::string::npos ||
+        s.find("思考") != std::string::npos || s.find("点头") != std::string::npos) return 1;  // 思考/点头
+    if (s.find("idle") != std::string::npos || s.find("stand") != std::string::npos ||
+        s.find("待机") != std::string::npos) return 0;   // 待机
+    return -1;
+}
+
+// 视线字符串 -> L2dGazeMode；返回 -1 表示不覆盖。
+static int ParseDirectorGaze(const std::string& raw) {
+    std::string s;
+    for (char c : raw) s += (char)tolower((unsigned char)c);
+    if (s.find("away") != std::string::npos || s.find("aside") != std::string::npos ||
+        s.find("移开") != std::string::npos || s.find("别处") != std::string::npos ||
+        s.find("傲娇") != std::string::npos) return L2D_GAZE_AWAY;
+    if (s.find("down") != std::string::npos || s.find("shy") != std::string::npos ||
+        s.find("低头") != std::string::npos || s.find("害羞") != std::string::npos) return L2D_GAZE_DOWN;
+    if (s.find("user") != std::string::npos || s.find("owner") != std::string::npos ||
+        s.find("主人") != std::string::npos || s.find("看我") != std::string::npos ||
+        s.find("straight") != std::string::npos) return L2D_GAZE_AT_USER;
+    return -1;
+}
+
 static std::string ExtractAssistantContent(const std::string& body) {
     size_t p = body.find("\"content\"");
     if (p == std::string::npos) return "";
@@ -2754,8 +4674,8 @@ static bool TtsPostOnce(const std::wstring& host, int port, const std::wstring& 
     HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"POST", path.c_str(),
         NULL, NULL, NULL, 0);
     if (!hRequest) { TtsLog("error", "WinHttpOpenRequest failed"); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return false; }
-    WinHttpAddRequestHeaders(hRequest, L"Content-Type: application/json; charset=utf-8", -1, WINHTTP_ADDREQ_FLAG_ADD);
-    WinHttpAddRequestHeaders(hRequest, L"Accept: audio/wav,*/*", -1, WINHTTP_ADDREQ_FLAG_ADD);
+    WinHttpAddRequestHeaders(hRequest, L"Content-Type: application/json; charset=utf-8", (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD);
+    WinHttpAddRequestHeaders(hRequest, L"Accept: audio/wav,*/*", (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD);
     BOOL sent = WinHttpSendRequest(hRequest, NULL, 0, (LPVOID)body.c_str(),
         (DWORD)body.length(), (DWORD)body.length(), 0);
     if (!sent) {
@@ -2772,11 +4692,15 @@ static bool TtsPostOnce(const std::wstring& host, int port, const std::wstring& 
     if (WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
         WINHTTP_HEADER_NAME_BY_INDEX, &code, &cs, WINHTTP_NO_HEADER_INDEX))
         outStatus = (int)code;
+    // ★安全：TTS 音频设 64MB 上限 + 4MB 分块，防止服务端异常时无限增长
+    const size_t kMaxTtsBytes = 64u * 1024u * 1024u;
     std::vector<char> data;
     DWORD dwSize = 0, dwDownloaded = 0;
     for (;;) {
         dwSize = 0;
         if (!WinHttpQueryDataAvailable(hRequest, &dwSize) || dwSize == 0) break;
+        if (data.size() >= kMaxTtsBytes) break;
+        if (dwSize > 4u * 1024u * 1024u) dwSize = 4u * 1024u * 1024u;
         std::vector<char> buf(dwSize);
         if (!WinHttpReadData(hRequest, buf.data(), dwSize, &dwDownloaded) || dwDownloaded == 0) break;
         data.insert(data.end(), buf.begin(), buf.begin() + dwDownloaded);
@@ -2795,9 +4719,27 @@ static bool TtsPostOnce(const std::wstring& host, int port, const std::wstring& 
     return true;
 }
 
-static bool CallTTSService(const std::wstring& jaText, std::wstring* errOut) {
+// ★ 前置声明：TtsSynth 等函数要先用到这几个配置读取函数，
+//   但它们的定义在下面（GetLLMConfig 在 3722 行附近）。
+// 前置声明保证后续函数可见。
+static std::wstring GetLLMConfig(const wchar_t* key);
+static double GetLLMConfigDouble(const wchar_t* key, double defVal, double lo, double hi);
+static int GetLLMConfigInt(const wchar_t* key, int defVal, int lo, int hi);
+
+// ★ 只负责"合成"：返回一整个 WAV 的字节，不碰播放。
+//   拆出来是为了分段流式——先合第一句就能开口，而不是等整段 600 字都合成完。
+// emo: 情绪语气。默认 Neutral 时对 ini 基准值无影响，旧调用点行为不变。
+static bool TtsSynth(const std::wstring& jaText, std::vector<char>* outWav,
+                     std::wstring* errOut, PetEmotion emo = PetEmotion::Base) {
     if (errOut) errOut->clear();
+    if (outWav) outWav->clear();
     if (jaText.empty()) return false;
+
+    // 情绪只微调语速/语调，乘在 ini 基准上；用户可在 [LLM] EmotionTone=0 关闭。
+    EmotionTone tone = ToneForEmotion(emo);
+    bool useTone = GetLLMConfigInt(L"EmotionTone", 1, 0, 1) != 0;
+    double speedScale = useTone ? tone.speed : 1.0;
+    double tempScale  = useTone ? tone.temperature : 1.0;
 
     std::wstring host      = GetIniStr(L"TTS", L"TtsHost", L"127.0.0.1");
     int          port      = GetIniInt(L"TTS", L"TtsPort", 9880, 1, 65535);
@@ -2833,7 +4775,7 @@ static bool CallTTSService(const std::wstring& jaText, std::wstring* errOut) {
     //      prompt_text 是【必填】，v1/v2 才是可选。所以下面无条件发送 prompt_text，
     //      并且 v3 系下为空时直接提前报错，不留到服务端才失败。
     //   2) 各版本的采样默认值不同，这里全部显式写出，不依赖服务端默认值。
-    //   ★ 关键修复：不再发送 "split_text"。它根本不是 api_v2.py 的字段。
+    //   不发送 "split_text"：它不是 api_v2.py 的字段。
     //     FastAPI 默认会忽略多余字段，但部分整合包（v2pro 分支就有）把模型配成了
     //     extra="forbid"，多一个字段就返回 422 —— 表现就是"没有任何语音"，
     //     而服务端日志里只有一个看不懂的 422，很难往参数上想。
@@ -2880,12 +4822,12 @@ static bool CallTTSService(const std::wstring& jaText, std::wstring* errOut) {
         "\"prompt_lang\": \"" + EscapeJsonA(WideStringToUtf8(promptLang)) + "\","
         "\"top_k\": " + std::to_string(GetIniInt(L"TTS", L"TtsTopK", 15, 1, 100)) + ","
         "\"top_p\": " + numStr(GetIniDbl(L"TTS", L"TtsTopP", 1.0, 0.0, 1.0)) + ","
-        "\"temperature\": " + numStr(GetIniDbl(L"TTS", L"TtsTemperature", 1.0, 0.0, 2.0)) + ","
+        "\"temperature\": " + numStr(min(2.0, max(0.0, GetIniDbl(L"TTS", L"TtsTemperature", 1.0, 0.0, 2.0) * tempScale))) + ","
         "\"text_split_method\": \"" + splitMethod + "\","
         "\"batch_size\": 1,"
         "\"batch_threshold\": 0.75,"
         "\"split_bucket\": true,"
-        "\"speed_factor\": " + numStr(GetIniDbl(L"TTS", L"TtsSpeed", 1.0, 0.5, 2.0)) + ","
+        "\"speed_factor\": " + numStr(min(2.0, max(0.5, GetIniDbl(L"TTS", L"TtsSpeed", 1.0, 0.5, 2.0) * speedScale))) + ","
         "\"fragment_interval\": 0.3,"
         "\"seed\": -1,"
         "\"media_type\": \"wav\","
@@ -2995,15 +4937,243 @@ static bool CallTTSService(const std::wstring& jaText, std::wstring* errOut) {
         return false;
     }
 
-    // 直接用 XAudio2 从内存播放，不再写临时文件
-    if (!LoadWavFromMemory(wav, g_tts)) {
-        TtsLog("error", "wav 解析失败 bytes=" + std::to_string(wav.size()));
-        if (errOut) *errOut = L"返回的音频无法解析";
-        return false;
-    }
-    XSoundPlay(g_tts, false);
     TtsLog("ok", "path=" + WideStringToUtf8(usedPath) + " bytes=" + std::to_string(wav.size()));
+    if (outWav) outWav->swap(wav);
     return true;
+}
+
+
+// ==================================================================
+//  ★ 分段流式语音：边合成边播，而不是"整段合完才出声"
+//
+//  整段（最长 600 字）一次合成要 8~20 秒，期间模型无声、嘴也不动，
+//  体感就是"说完台词半天才响"，因此改为边合成边播。
+//
+//  现在的链路：
+//     日语台词 → 按标点切句 → 后台线程逐句合成 → 主线程逐句播放
+//  第一句合完（通常 1~2 秒）就开口，后面的边播边合。
+//  语音朗读与文字显示同步进行。
+// ==================================================================
+
+struct TtsJob {
+    std::wstring      text;
+    std::vector<char> wav;
+    int               state = 0;    // 0=待合成  1=合成中  2=就绪  -1=失败
+};
+
+static std::vector<TtsJob>     g_ttsJobs;
+static size_t                  g_ttsPlayIdx = 0;
+static std::recursive_mutex    g_ttsJobMtx;
+// ★ 专门保护 g_tts 这个 XSound：主线程在换段时会 Reset（销毁 voice），
+//   LLM 线程打断时会 Stop。两边不加锁会撞在同一个 voice 上，偶尔崩在
+//   CreateSourceVoice / DestroyVoice 里。加锁顺序统一为先 job 后 voice。
+static std::recursive_mutex    g_ttsVoiceMtx;
+static std::atomic<uint32_t>   g_ttsGen{ 0 };      // 批次号：换话题后丢弃旧批次的结果
+static std::atomic<bool>       g_ttsAbort{ false }; // 本轮语音已作废
+static std::atomic<bool>       g_ttsQuit{ false };  // 进程退出，工作线程收尾
+static std::atomic<int>        g_ttsFailCount{ 0 };
+static bool                    g_ttsErrNotified = false;   // 每轮只提示一次，不刷屏
+static std::wstring            g_ttsLastErr;
+static PetEmotion              g_ttsEmo = PetEmotion::Base;
+static HANDLE                  g_hTtsEvent = nullptr;   // 有新任务时 Set
+static HANDLE                  g_hTtsWorker = nullptr;
+
+// 去掉不该念出来的东西：动作描写、markdown 符号、括号注释。
+// 不处理会听到"抬手摸了摸你的头发"这种旁白被朗读，非常出戏。
+static std::wstring TtsStripMarks(const std::wstring& in) {
+    std::wstring out;
+    out.reserve(in.size());
+    int depth = 0;
+    for (size_t i = 0; i < in.size(); ++i) {
+        wchar_t c = in[i];
+        if (c == L'（' || c == L'(') { ++depth; continue; }
+        if (c == L'）' || c == L')') { if (depth > 0) --depth; continue; }
+        if (depth > 0) continue;
+        // 括号里的动作描写已剔除；剩下的修饰符直接丢
+        if (c == L'*' || c == L'_' || c == L'`' || c == L'#' || c == L'~') continue;
+        if (c == L'「' || c == L'」' || c == L'『' || c == L'』') continue;
+        out += c;
+    }
+    // 收敛连续空白：GPT-SoVITS 对多余空格会当成停顿，容易拖出怪节奏
+    std::wstring compact;
+    compact.reserve(out.size());
+    bool lastSpace = false;
+    for (wchar_t c : out) {
+        bool sp = (c == L' ' || c == L'\t' || c == L'\r' || c == L'\n');
+        if (sp) { if (!lastSpace) compact += L' '; lastSpace = true; }
+        else { compact += c; lastSpace = false; }
+    }
+    size_t b = compact.find_first_not_of(L" ");
+    if (b == std::wstring::npos) return L"";
+    size_t e = compact.find_last_not_of(L" ");
+    return compact.substr(b, e - b + 1);
+}
+
+// 按标点切句。硬标点必断，软标点在够长时才断，兜底按长度硬切。
+// 切得太碎会让 TTS 每句都重新起调，听起来一顿一顿；太长又回到"等半天"。
+static std::vector<std::wstring> TtsSplitText(const std::wstring& in, int maxLen) {
+    std::vector<std::wstring> out;
+    std::wstring cur;
+    auto flush = [&]() {
+        // 至少要有实际内容，纯标点段会让服务端报错或产生怪音
+        bool hasWord = false;
+        for (wchar_t c : cur) {
+            if (iswalnum(c) || (c >= 0x3040 && c != L'　')) { hasWord = true; break; }
+        }
+        if (hasWord) {
+            size_t b = cur.find_first_not_of(L" ");
+            if (b != std::wstring::npos) out.push_back(cur.substr(b));
+        }
+        cur.clear();
+    };
+    for (wchar_t c : in) {
+        cur += c;
+        bool hard = (c == L'。' || c == L'！' || c == L'？' || c == L'!' || c == L'?'
+                  || c == L'\n' || c == L'；' || c == L';');
+        bool soft = (c == L'、' || c == L'，' || c == L',' || c == L'…' || c == L'　');
+        if (hard) { flush(); }
+        else if (soft && (int)cur.size() * 10 >= maxLen * 6) { flush(); }
+        else if ((int)cur.size() >= maxLen) { flush(); }
+    }
+    flush();
+    return out;
+}
+
+// 后台合成线程：常驻，用事件唤醒，不反复创建销毁。
+static unsigned __stdcall TtsWorkerProc(void*) {
+    for (;;) {
+        WaitForSingleObject(g_hTtsEvent, 300);
+        if (g_ttsQuit.load()) break;
+        for (;;) {
+            if (g_ttsAbort.load() || g_ttsQuit.load()) break;
+            int idx = -1;
+            uint32_t gen = 0;
+            std::wstring text;
+            {
+                std::lock_guard<std::recursive_mutex> lk(g_ttsJobMtx);
+                if (g_ttsAbort.load()) break;
+                for (size_t i = 0; i < g_ttsJobs.size(); ++i) {
+                    if (g_ttsJobs[i].state == 0) { g_ttsJobs[i].state = 1; idx = (int)i; break; }
+                }
+                if (idx < 0) break;                       // 本批次已全部投递
+                text = g_ttsJobs[idx].text;
+                gen  = g_ttsGen.load();
+            }
+            std::vector<char> wav;
+            std::wstring err;
+            bool ok = TtsSynth(text, &wav, &err, g_ttsEmo);
+            if (g_ttsQuit.load()) break;
+            // ★ 合成期间用户可能已经发了新消息：批次号变了就整段丢弃，
+            //   否则会把上一轮的语音插进新对话里，听起来像抢话。
+            if (g_ttsAbort.load() || gen != g_ttsGen.load()) break;
+            {
+                std::lock_guard<std::recursive_mutex> lk(g_ttsJobMtx);
+                if (gen != g_ttsGen.load()) break;
+                if ((size_t)idx < g_ttsJobs.size()) {
+                    g_ttsJobs[idx].state = ok ? 2 : -1;
+                    if (ok) g_ttsJobs[idx].wav.swap(wav);
+                }
+            }
+            if (!ok) {
+                g_ttsFailCount.fetch_add(1);
+                if (!err.empty()) g_ttsLastErr = err;
+            }
+        }
+    }
+    return 0;
+}
+
+static void TtsWorkerEnsure() {
+    if (g_hTtsWorker) return;
+    if (!g_hTtsEvent) g_hTtsEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!g_hTtsEvent) return;
+    unsigned tid = 0;
+    g_hTtsWorker = (HANDLE)_beginthreadex(nullptr, 0, TtsWorkerProc, nullptr, 0, &tid);
+}
+
+// 立刻停止当前语音并作废本批次（发新消息、切服装、退出时调用）。
+static void TtsStopAll() {
+    g_ttsAbort.store(true);
+    g_ttsGen.fetch_add(1);
+    {
+        std::lock_guard<std::recursive_mutex> lk(g_ttsJobMtx);
+        g_ttsJobs.clear();
+        g_ttsPlayIdx = 0;
+    }
+    {
+        std::lock_guard<std::recursive_mutex> lk(g_ttsVoiceMtx);
+        if (g_tts.v) XSoundStop(g_tts);
+        g_tts.playing = false;
+    }
+}
+
+// 朗读一段日语台词：切句 → 投递 → 后台合成。已有语音会被打断（不叠音）。
+static void TtsSpeak(const std::wstring& jpText, PetEmotion emo) {
+    TtsStopAll();
+    if (!g_ttsVoiceOn.load()) return;
+    std::wstring clean = TtsStripMarks(jpText);
+    if (clean.empty()) return;
+
+    int maxLen = GetIniInt(L"TTS", L"TtsSegMaxChars", 60, 12, 300);
+    std::vector<std::wstring> segs = TtsSplitText(clean, maxLen);
+    if (segs.empty()) return;
+
+    g_ttsEmo = emo;
+    g_ttsFailCount.store(0);
+    g_ttsErrNotified = false;
+    g_ttsLastErr.clear();
+    {
+        std::lock_guard<std::recursive_mutex> lk(g_ttsJobMtx);
+        g_ttsJobs.clear();
+        for (auto& t : segs) {
+            TtsJob j;
+            j.text = std::move(t);
+            g_ttsJobs.push_back(std::move(j));
+        }
+        g_ttsPlayIdx = 0;
+    }
+    g_ttsAbort.store(false);
+    g_ttsGen.fetch_add(1);          // 新批次：让上一批还在飞的合成结果作废
+    TtsWorkerEnsure();
+    if (g_hTtsEvent) SetEvent(g_hTtsEvent);
+    TtsLog("speak", "segs=" + std::to_string(segs.size()));
+}
+
+// 主循环每帧调用：上一句放完就接下一句。
+static void TtsPump() {
+    if (g_ttsAbort.load()) return;
+    if (g_tts.playing) return;                 // 还在响，别打断
+    std::vector<char> wav;
+    bool allDone = false;
+    {
+        std::lock_guard<std::recursive_mutex> lk(g_ttsJobMtx);
+        if (g_ttsJobs.empty()) return;
+        // 跳掉合成失败的句子：宁可少一句，也不要卡在这儿让整段语音停住
+        while (g_ttsPlayIdx < g_ttsJobs.size() && g_ttsJobs[g_ttsPlayIdx].state == -1)
+            ++g_ttsPlayIdx;
+        if (g_ttsPlayIdx >= g_ttsJobs.size()) { allDone = true; }
+        else if (g_ttsJobs[g_ttsPlayIdx].state == 2) {
+            wav.swap(g_ttsJobs[g_ttsPlayIdx].wav);
+            ++g_ttsPlayIdx;
+        }
+        // 还没合完（state==0/1）：这一帧什么都不做，等后台线程
+    }
+    // ★ 这一轮全部处理完且存在失败句子：在聊天窗口里说明一次。
+    //   不然用户只会觉得"没声音"，而真正的原因（参考音频缺失 / 端口不对）藏在日志里。
+    if (allDone && !g_ttsErrNotified && g_ttsFailCount.load() > 0) {
+        g_ttsErrNotified = true;
+        if (g_hChatWnd && IsWindow(g_hChatWnd)
+            && GetIniInt(L"TTS", L"TtsShowError", 1, 0, 1)) {
+            std::wstring msg = L"\r\n（语音合成失败："
+                + (g_ttsLastErr.empty() ? std::wstring(L"服务无响应") : g_ttsLastErr)
+                + L"，详见 DebugView 的 [TTS]）\r\n";
+            auto* em = new std::wstring(msg);
+            if (!PostMessageW(g_hChatWnd, WM_APPEND_TEXT, 0, (LPARAM)em)) delete em;
+        }
+    }
+    if (wav.empty()) return;
+    std::lock_guard<std::recursive_mutex> lk(g_ttsVoiceMtx);
+    if (LoadWavFromMemory(wav, g_tts)) XSoundPlay(g_tts, false);
 }
 
 // 兼容旧键名 [LLM] TTSMaxChars，新的统一放 [TTS]
@@ -3021,9 +5191,7 @@ static std::wstring GetLLMConfig(const wchar_t* key) {
     std::wstring exeDir;
     if (!GetExeDir(exeDir)) return L"";
     std::wstring iniPath = exeDir + L"\\llm.ini";   // 用 wstring 拼路径，避免 MAX_PATH 栈数组
-    std::vector<wchar_t> buf(512, L'\0');
-    GetPrivateProfileStringW(L"LLM", key, L"", buf.data(), (DWORD)buf.size(), iniPath.c_str());
-    return std::wstring(buf.data());
+    return ReadIniStringDyn(L"LLM", key, L"", iniPath);
 }
 
 // 读数值型配置：ini 里没写就用 defVal，超出 [lo,hi] 就钳制
@@ -3049,22 +5217,69 @@ static int GetLLMConfigInt(const wchar_t* key, int defVal, int lo, int hi) {
     return (int)d;
 }
 
+// UI 配置（llm.ini 的 [UI] 段）：字号/字体/主题等。
+// 缺省沿用旧值，不影响未配置 [UI] 的用户。
+static std::wstring GetUIConfigStr(const wchar_t* key, const wchar_t* defVal) {
+    std::wstring exeDir;
+    if (!GetExeDir(exeDir)) return defVal ? defVal : L"";
+    std::wstring iniPath = exeDir + L"\\llm.ini";
+    return ReadIniStringDyn(L"UI", key, defVal, iniPath);
+}
+static int GetUIConfigInt(const wchar_t* key, int defVal, int lo, int hi) {
+    std::wstring v = GetUIConfigStr(key, L"");
+    if (v.empty()) return defVal;
+    wchar_t* end = nullptr;
+    long d = wcstol(v.c_str(), &end, 10);
+    if (end == v.c_str()) return defVal;
+    if (d < lo) return lo;
+    if (d > (long)hi) return hi;
+    return (int)d;
+}
+
 // ==================== 长文本模式 ====================
 // 主人想要"一整段内容"（故事、讲解、教程）时，用默认的 3000 token 上限
-// 会被生生截断，故事讲一半就没了。这里识别出来后单独放宽上限并追加指令。
-static const wchar_t* LONG_KEYWORDS[] = {
-    L"故事", L"童话", L"睡前", L"讲一个", L"讲个", L"讲讲", L"编一个", L"编个",
-    L"写一篇", L"写个", L"写一段", L"长篇", L"长一点", L"详细", L"展开讲", L"展开",
-    L"具体说说", L"说说看", L"介绍一下", L"讲解", L"教程", L"教学", L"教我",
-    L"原理", L"完整", L"续写", L"接下去", L"然后呢", L"举例", L"列举",
-    L"分析一下", L"为什么", L"来历", L"传说", L"背景设定", L"世界观"
-};
+// 会被生生截断，故事讲一半就没了。M6 起改为"强指令 + 弱词特征"双重判定，
+// 强/弱关键词表直接内联在 IsLongFormRequest 里，避免维护两份常量。
 
+// 长文触发双重判定：
+//   1) 手动开关（llm.ini [LLM] LongFormManual：0=短文 1=长文 2=自动，默认 2）
+//      - 显式设为 1 -> 直接进长文；设为 0 -> 强制短文（除非命中强指令）；
+//   2) 自动模式按"显式长指令 或 (强关键词 + 输入特征)"判定：
+//      - 命中任一"强指令"（讲一个故事/写一篇/详细展开/完整/续写/长篇）-> 长文；
+//      - 命中"弱词"（为什么/介绍一下/原理）需搭配输入特征（>=20 字 或 含"讲/写/详"）才放宽；
+//      - 纯"为什么"这类弱提问不再误触发 8000 token 长文。
+//   这样减少误触发、响应更快，同时保留"主人要长篇"时的完整输出。
 static bool IsLongFormRequest(const std::wstring& text) {
     if (text.empty()) return false;
+    int manual = GetLLMConfigInt(L"LongFormManual", 2, 0, 2);   // 0 短文 / 1 长文 / 2 自动
+    if (manual == 1) return true;                                 // 手动强开
     if (GetLLMConfigInt(L"LongMode", 1, 0, 1) == 0) return false;
-    for (const wchar_t* k : LONG_KEYWORDS)
+    if (manual == 0) {
+        // 手动短文：仅当输入命中"强指令"才放宽，否则一律短文
+        static const wchar_t* strong[] = { L"讲一个", L"讲个", L"写一篇", L"写个", L"写一段",
+            L"长篇", L"详细", L"完整", L"续写", L"接下去", L"展开讲" };
+        for (const wchar_t* k : strong)
+            if (text.find(k) != std::wstring::npos) return true;
+        return text.size() >= 120;    // 手动短文模式下，超大段输入才放宽
+    }
+    // 自动模式（默认）：强指令直接命中
+    static const wchar_t* strong[] = { L"讲一个", L"讲个", L"讲讲", L"编一个", L"编个",
+        L"写一篇", L"写个", L"写一段", L"长篇", L"长一点", L"详细", L"展开讲", L"展开",
+        L"续写", L"接下去", L"完整", L"睡前", L"童话", L"教程", L"教学", L"教我",
+        L"列举", L"分析一下", L"来历", L"传说", L"背景设定", L"世界观", L"介绍一下", L"原理" };
+    for (const wchar_t* k : strong)
         if (text.find(k) != std::wstring::npos) return true;
+    // 弱词需搭配输入特征（>=20 字 或 含"讲/写/详"），避免"为什么"误触发
+    static const wchar_t* weak[] = { L"为什么", L"说说看", L"具体说说", L"举例", L"然后呢" };
+    bool hasWeak = false;
+    for (const wchar_t* k : weak)
+        if (text.find(k) != std::wstring::npos) hasWeak = true;
+    if (hasWeak) {
+        bool feature = (text.size() >= 20) ||
+            (text.find(L"讲") != std::wstring::npos || text.find(L"写") != std::wstring::npos ||
+             text.find(L"详") != std::wstring::npos);
+        if (feature) return true;
+    }
     return text.size() >= 80;      // 输入本身就一大段，大概率也要长回答
 }
 
@@ -3079,6 +5294,21 @@ L"4. 全程保持茉子的口吻和性格，长文里也要有俏皮、有情绪
 L"5. ja 是同一段内容的日语版；如果长度不够分配，优先保证 zh 完整。\n"
 L"6. 仍然只输出一个 JSON 对象。";
 
+// 导演字段补充指令：只扩展输出的"演出字段"，不改变人设/世界观/口吻/语言风格。
+// 由 llm.ini [LLM] DirectorEnable=1 控制（默认开）；设为 0 则完全不追加，
+// 模型仍按你自己的 prompt.txt 输出 zh/ja/emotion，行为与改造前完全一致。
+// 所有新字段都标为"可选"，模型不输出也能正常对话（代码端有缺省回退）。
+static const wchar_t* DIRECTOR_INSTRUCT =
+L"\n\n【演出字段（可选，仅在自然贴切时附带）】\n"
+L"在保持原有 JSON 字段不变的前提下，你可以额外附带以下字段来让演出更贴合你说的话；"
+L"如果觉得没必要，全部省略即可，不要为了填字段而牺牲说话的自然：\n"
+L"- \"intensity\": 0到1的小数，表示这句话的情绪强度（平静0.2、一般0.5、很激动0.9）。\n"
+L"- \"action\": 从 idle(待机)/think(点头思考)/peace(开心摇摆) 里选一个最贴合当前情绪的，可不填。\n"
+L"- \"gaze\": 从 at_user(看着主人)/away(移开视线)/down(害羞低头) 里选一个，可不填。\n"
+L"- \"memory\": 如果这次对话里你得知了关于主人的、值得长期记住的事实（比如称呼、喜好、约定、纪念日），"
+L"用一句简短的话写在这里；没有就省略。不要记无关紧要的闲聊。\n"
+L"这些字段只影响动作和视线演出，不改变你说话的性格与口吻。";
+
 // ==================== 打字机自适应 ====================
 // 按字数动态决定打字速度：固定 30ms/字的话，1500 字的长文要打 45 秒，观感像卡死。
 // 改成按"目标总时长"反推每字延时和每批字符数。
@@ -3088,6 +5318,9 @@ static TypewriterPlan PlanTypewriter(size_t len) {
     int targetMs = GetLLMConfigInt(L"TypewriterTargetMs", 6000, 500, 120000);
     int minDelay = GetLLMConfigInt(L"TypewriterMinDelayMs", 2, 0, 500);
     int maxDelay = GetLLMConfigInt(L"TypewriterMaxDelayMs", TYPEWRITER_DELAY_MS, 1, 500);
+    // [UI] TypewriterSkipMode：2=加速模式，把目标时长砍半（整体更快显示）
+    int skipMode = GetUIConfigInt(L"TypewriterSkipMode", 1, 0, 2);
+    if (skipMode == 2) targetMs /= 2;
     if (len == 0) return { maxDelay, 1 };
     double perChar = (double)targetMs / (double)len;
     int delay = (int)floor(perChar);
@@ -3120,8 +5353,10 @@ static const char* DEFAULT_PROMPT =
 "6. 每句话都要有实际内容或真实情绪，不要重复自己说过的话。\n"
 "\n"
 "【输出格式】只返回一个纯JSON对象，不要任何解释、不要Markdown代码块、不要```符号。\n"
-"格式严格为：{\"zh\":\"中文回复\",\"ja\":\"意思相同的日语回复，用常陆茉子口吻\"}\n"
+"格式严格为：{\"zh\":\"中文回复\",\"ja\":\"意思相同的日语回复，用常陆茉子口吻\",\"emotion\":\"情绪\"}\n"
 "规则：zh和ja都不能为空；ja要与zh同样饱满有感情，不要缩短；\n"
+"emotion 必须原样填写下面 8 个表情槽名之一（含下划线和数字，不要自造词、不要写中文）："
+"base(平静)/smile(微笑)/smile_sulky(坏笑)/panic(惊慌)/shy_blush(害羞脸红)/embarrassed(尴尬抿嘴)/thinking2(思考)/wonder(疑惑)。\n"
 "内部双引号必须转义为\\\"，换行用\\n；如果用户说的不是中文，也先按中文理解再生成zh和ja。";
 
 static std::wstring LoadPrompt() {
@@ -3138,6 +5373,451 @@ static std::wstring LoadPrompt() {
     fclose(f);
     std::wstring promptW(content.data(), nread);
     return promptW.empty() ? Utf8ToWideString(DEFAULT_PROMPT) : promptW;
+}
+
+// ==================================================================
+// 启动时缓存 prompt + 记忆，避免每条请求全量读盘；
+//   历史文件加滚动归档（超 N KB 轮转），防止无限增长。
+// ==================================================================
+// 历史文件写锁：聊天/触摸两条 LLM 线程都往 chat_history.txt 追加，
+//   加一把锁避免多线程 append 交错写坏文件。
+static std::recursive_mutex g_historyFileMtx;
+
+static std::wstring g_promptCache;                   // prompt 启动缓存
+static std::mutex   g_promptCacheMtx;
+static bool         g_promptCacheLoaded = false;
+
+// 取缓存的 prompt：首次（或缓存失效）读盘，之后直接返回。
+static std::wstring GetCachedPrompt() {
+    std::lock_guard<std::mutex> lk(g_promptCacheMtx);
+    if (!g_promptCacheLoaded) {
+        g_promptCache = LoadPrompt();
+        g_promptCacheLoaded = true;
+    }
+    return g_promptCache;
+}
+
+// 缓存失效（比如 prompt.txt 被外部改过、或用户清缓存）时调用。
+static void InvalidatePromptCache() {
+    std::lock_guard<std::mutex> lk(g_promptCacheMtx);
+    g_promptCache.clear();
+    g_promptCacheLoaded = false;
+}
+
+// 记忆缓存：内存里持有一份，写入时同步（见 AppendMemoryLine 末尾）。
+static std::vector<std::wstring> g_memoryCache;
+static std::mutex                 g_memoryCacheMtx;
+static bool                       g_memoryCacheLoaded = false;
+
+// 前置声明（定义在下方长期记忆区）：缓存冷启动时要读盘
+static std::vector<std::wstring> LoadMemoryLines();
+
+static std::vector<std::wstring> GetMemoryCache() {
+    std::lock_guard<std::mutex> lk(g_memoryCacheMtx);
+    if (!g_memoryCacheLoaded) {
+        g_memoryCache = LoadMemoryLines();
+        g_memoryCacheLoaded = true;
+    }
+    return g_memoryCache;
+}
+
+// 历史滚动归档：chat_history.txt 超 N KB 时，把前半归档到 chat_history.old.txt，
+// 主文件只保留最近 1/2，避免无限增长。默认 512KB 触发（HistoryArchiveKB 可配）。
+static void ArchiveHistoryIfLarge() {
+    int maxKb = GetLLMConfigInt(L"HistoryArchiveKB", 512, 0, 8192);   // 0=不归档
+    if (maxKb <= 0) return;
+    std::wstring exeDir;
+    if (!GetExeDir(exeDir)) return;
+    std::wstring hist = exeDir + L"\\chat_history.txt";
+    std::wstring arch = exeDir + L"\\chat_history.old.txt";
+    FILE* f = nullptr;
+    _wfopen_s(&f, hist.c_str(), L"rb");
+    if (!f) return;
+    _fseeki64(f, 0, SEEK_END);
+    long long sz = _ftelli64(f);
+    long long threshold = (long long)maxKb * 1024;
+    if (sz > threshold) {
+        fclose(f);
+        std::lock_guard<std::recursive_mutex> lk(g_historyFileMtx);
+        // 读全文
+        std::wstring exeDir2;
+        GetExeDir(exeDir2);
+        FILE* rf = nullptr;
+        _wfopen_s(&rf, hist.c_str(), L"rb");
+        if (rf) {
+            std::string bytes;
+            char b[8192]; size_t n;
+            while ((n = fread(b, 1, sizeof b, rf)) > 0) bytes.append(b, n);
+            fclose(rf);
+            // 前半归档（追加到 .old），后半保留
+            size_t half = bytes.size() / 2;
+            FILE* af = nullptr;
+            _wfopen_s(&af, arch.c_str(), L"ab");
+            if (af) {
+                if (half > 0) fwrite(bytes.data(), 1, half, af);
+                fclose(af);
+            }
+            FILE* wf = nullptr;
+            _wfopen_s(&wf, hist.c_str(), L"wb");
+            if (wf) {
+                const unsigned char bom[3] = { 0xEF, 0xBB, 0xBF };
+                fwrite(bom, 1, 3, wf);
+                if (half < bytes.size()) fwrite(bytes.data() + half, 1, bytes.size() - half, wf);
+                fclose(wf);
+            }
+            PetDbgW(L"[M8] 历史已滚动归档\n");
+        }
+    } else {
+        fclose(f);
+    }
+}
+
+// ==================================================================
+//  ★ 对话文本换行规范化
+//  RichEdit 内部只把 CR 当段落符：裸 LF 会被原样塞进去，显示时不换行。
+//  模型回复来自 JSON，里面是 "\n"；本地拼接历来手写 "\r\n"；两条流水线
+//  混在一起，就出现"有的地方换行了、有的地方粘成一行"——也就是换行时灵时不灵。
+//  这里把所有来源统一成 CRLF：追加、落盘、读档三条路走同一套规则。
+// ==================================================================
+// 统一 CRLF，并把连续空行压到最多一空行（模型常在结尾甩 3~4 个换行）
+static std::wstring NormalizeCrlf(const std::wstring& in) {
+    std::wstring out;
+    out.reserve(in.size() + 16);
+    int run = 0;                                  // 连续换行计数（一个 CRLF 算一次）
+    for (size_t i = 0; i < in.size(); ++i) {
+        wchar_t c = in[i];
+        if (c == L'\r' || c == L'\n') {
+            if (c == L'\r' && i + 1 < in.size() && in[i + 1] == L'\n') ++i;
+            if (++run <= 2) out += L"\r\n";
+            continue;
+        }
+        run = 0;
+        out += c;
+    }
+    return out;
+}
+
+static bool IsBlankChar(wchar_t c) {
+    return c == L' ' || c == L'\t' || c == L'\r' || c == L'\n' || c == 0x3000;
+}
+
+// 去掉首尾空白（含换行）：避免出现"主人：\r\n\r\n\r\n\r\n茉子："这种空块
+static std::wstring TrimBlock(const std::wstring& in) {
+    size_t b = 0, e = in.size();
+    while (b < e && IsBlankChar(in[b])) ++b;
+    while (e > b && IsBlankChar(in[e - 1])) --e;
+    return in.substr(b, e - b);
+}
+
+// 流式分片可能把一个 CRLF 切成 "\r" 和 "\n" 两块，
+// 不做记账就会被补成两个换行（多出一个空行）。
+static bool g_streamCr = false;
+static int  g_nlRun    = 0;      // 连续换行计数（跨分片累计，和内存里的文本保持同步）
+
+// ★ 追加的唯一入口：规范化换行 + 光标移到末尾 + 滚到底。
+//   所有追加操作走这一处入口，统一换行处理与 EM_REPLACESEL 逻辑，
+//   避免多处各自实现导致行为不一致。
+//   连续空行限制为一个：模型经常在段末甩 3~4 个 \n，原样写进去就是一大片空白。
+static void AppendHistoryText(const std::wstring& text) {
+    if (text.empty()) return;
+    if (!g_hHistoryEdit || !IsWindow(g_hHistoryEdit)) return;
+    std::wstring norm;
+    norm.reserve(text.size() + 16);
+    for (wchar_t c : text) {
+        if (c == L'\r') { if (++g_nlRun <= 2) norm += L"\r\n"; g_streamCr = true; }
+        else if (c == L'\n') {
+            if (g_streamCr) g_streamCr = false;                 // 已被上一块的 \r 消费
+            else if (++g_nlRun <= 2) norm += L"\r\n";
+        } else { g_streamCr = false; g_nlRun = 0; norm += c; }
+    }
+    if (norm.empty()) return;
+    DWORD end = GetWindowTextLengthW(g_hHistoryEdit);
+    SendMessageW(g_hHistoryEdit, EM_SETSEL, (WPARAM)end, (LPARAM)end);
+    SendMessageW(g_hHistoryEdit, EM_REPLACESEL, TRUE, (LPARAM)norm.c_str());
+    SendMessageW(g_hHistoryEdit, EM_LINESCROLL, 0, 10000);
+}
+
+// 只读控件尾部几个字符，不整段取文本（历史可能上百 KB）。
+// 这里不走 richedit.h：本文件只动态加载 Msftedit.dll，从没包含过该头文件，
+// 直接按其 ABI 声明区间结构 + 消息号（EM_GETTEXTRANGE = WM_USER + 75）即可。
+struct PetCharRange { LONG cpMin; LONG cpMax; };          // == CHARRANGE
+struct PetTextRange { PetCharRange chrg; LPWSTR lpstrText; };
+#ifndef EM_GETTEXTRANGE
+#define EM_GETTEXTRANGE (WM_USER + 75)
+#endif
+
+static std::wstring HistoryTail(int maxChars) {
+    if (!g_hHistoryEdit || !IsWindow(g_hHistoryEdit)) return L"";
+    long len = (long)GetWindowTextLengthW(g_hHistoryEdit);
+    if (len <= 0) return L"";
+    if (maxChars < 4) maxChars = 4;
+    long from = (len > maxChars) ? len - maxChars : 0;
+    wchar_t buf[64] = { 0 };
+    PetTextRange tr{};
+    tr.chrg.cpMin = from; tr.chrg.cpMax = len;
+    tr.lpstrText = buf;
+    SendMessageW(g_hHistoryEdit, EM_GETTEXTRANGE, 0, (LPARAM)&tr);
+    return std::wstring(buf);
+}
+
+// 数尾部有几个"段落分隔"。RichEdit 内部用单个 CR 表示换行，EM_GETTEXTRANGE 读回来也是 CR，
+// 只有 GetWindowText 才还原成 CRLF —— 所以这里两种写法都要认。
+static int CountTrailingBreaks(const std::wstring& s) {
+    int n = 0; size_t i = s.size();
+    while (i > 0) {
+        wchar_t c = s[i - 1];
+        if (c == L'\n') { --i; continue; }            // CRLF 里的 LF 不单独算一次换行
+        if (c == L'\r') { --i; ++n; continue; }
+        break;
+    }
+    return n;
+}
+
+// ★ 保证"上一段话"和"下一段话"之间隔着一个空行。
+//   统一维护段间空行，避免各处手写前缀导致空行数量不一致。
+static void EnsureHistoryBlankLine() {
+    if (!g_hHistoryEdit || !IsWindow(g_hHistoryEdit)) return;
+    std::wstring tail = HistoryTail(16);
+    if (tail.empty()) return;
+    size_t n = tail.size();                       // 尾部空格不算内容
+    while (n > 0 && (tail[n - 1] == L' ' || tail[n - 1] == L'\t')) --n;
+    tail.resize(n);
+    if (CountTrailingBreaks(tail) >= 2) return;   // 已经是空行，别再补
+    // 上一段（尤其是模型回复）可能以换行结尾，此时 g_nlRun 还停在
+    //   1 或 2，AppendHistoryText 的去重逻辑会把分隔符整段丢掉，于是"茉子：…主人：…"
+    //   粘成一行。这里先清零记账，保证分隔符一定写进去。
+    g_nlRun = 0; g_streamCr = false;
+    AppendHistoryText(CountTrailingBreaks(tail) == 1 ? L"\r\n" : L"\r\n\r\n");
+}
+
+// ==================================================================
+// 聊天记录角色/情绪上色：RichEdit 按块前缀设色，长对话里可扫读。
+//   主人=蓝、茉子=朱红、旁白(（…）)=灰斜体、好感提示=绿。
+//   用 EM_SETCHARFORMAT + SCF_SELECTION 只给"刚追加的块"上色，不全量重排。
+//   CHARFORMAT2W/CHARRANGE/CFM_*/SCF_* 均来自 <richedit.h>（见文件头 include），
+//   不再手写结构体——手写布局一旦和 SDK 不一致，RichEdit 会读错字段导致上色失效。
+//   注：EM_SETCHARFORMAT / EM_GETTEXTRANGE / SCF_SELECTION 在 richedit.h 已有定义，
+//   下面这些 #ifndef 仅为兼容旧 SDK 保留兜底，正常不会生效。
+// ==================================================================
+#ifndef EM_SETCHARFORMAT
+#define EM_SETCHARFORMAT (WM_USER + 68)
+#endif
+#ifndef SCF_SELECTION
+#define SCF_SELECTION 1
+#endif
+
+// 说话人判定：除了"主人："这种标准前缀，也要认"（主动搭话）茉子："这种带标注的写法
+// （标注不会太长，限定在前 12 个字符内，避免正文里提到"茉子："被误判）。
+static bool BlockStartsWithSpeaker(const std::wstring& block, const wchar_t* tag) {
+    size_t pos = block.find(tag);
+    return pos != std::wstring::npos && pos <= 12;
+}
+
+// 按块前缀取颜色与效果（-1 表示不上色，沿用默认）。
+// ★配色约定（玩家指定）：主人=蓝、茉子=绿、旁白(（…）)=灰斜体、好感/心情提示=琥珀。
+//   颜色随主题取两套（深底用更亮的色保证对比度），由 g_chatTheme 缓存决定。
+static void ColorForPrefix(const std::wstring& block, LONG& color, DWORD& effects) {
+    effects = 0;
+    const bool dark = (g_chatTheme == 1);
+    if (BlockStartsWithSpeaker(block, L"主人：")) {
+        color = dark ? RGB(115, 175, 255) : RGB(0, 102, 204);     // 蓝（主人）
+        return;
+    }
+    if (BlockStartsWithSpeaker(block, L"茉子：")) {
+        color = dark ? RGB(110, 220, 140) : RGB(21, 128, 61);     // 绿（茉子）
+        return;
+    }
+    if (!block.empty() && block[0] == L'（') {
+        if (block.find(L"好感") != std::wstring::npos ||
+            block.find(L"茉子的心意") != std::wstring::npos ||
+            block.find(L"茉子的心情") != std::wstring::npos) {
+            // 琥珀色：与茉子的绿区分，暖色便于一眼识别
+            color = dark ? RGB(240, 190, 90) : RGB(176, 108, 0);
+        } else {
+            color = dark ? RGB(180, 180, 190) : RGB(120, 120, 120); // 灰（旁白）
+            effects = CFE_ITALIC;
+        }
+        return;
+    }
+    color = -1;                        // 其它：不上色
+}
+
+// 给 [cpStart, cpEnd) 区间上色
+static void ColorizeRange(HWND edit, long cpStart, long cpEnd, LONG color, DWORD effects) {
+    if (!edit || !IsWindow(edit) || color < 0 || cpEnd <= cpStart) return;
+    SendMessageW(edit, EM_SETSEL, (WPARAM)cpStart, (LPARAM)cpEnd);
+    CHARFORMAT2W cf{};
+    cf.cbSize = sizeof(cf);
+    // 只改颜色 + 斜体效果；不碰 CFM_SIZE/CFM_FACE，避免把字号/字体重置掉。
+    cf.dwMask = CFM_COLOR | CFM_ITALIC;
+    cf.dwEffects = effects;              // 非斜体块传 0，显式清掉斜体位
+    cf.crTextColor = color;
+    SendMessageW(edit, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
+}
+
+// 把 [cpStart,cpEnd) 这段"实际写进控件的文本"读回来，
+//   按段落边界切开，每段各自识别前缀设色。
+//   ★★ 关键坑：RichEdit 的 cp 空间里，一个段落分隔占【2 格】（内部存 1 个 CR，
+//   但 GetWindowTextLengthW 按 CRLF 算长度），而 EM_GETTEXTRANGE 读回来的字符串里
+//   只有 1 个 CR。所以"raw 下标 == cp 下标"是错的，直接相加会让颜色随换行数量往左漂，
+//   长对话里越往后错得越多、末尾干脆不上色。这里先建一张 raw→cp 映射表再上色。
+static void ColorizeSpan(HWND edit, long cpStart, long cpEnd) {
+    if (!edit || !IsWindow(edit) || cpEnd <= cpStart) return;
+    long spanCp = cpEnd - cpStart;
+    std::wstring text((size_t)spanCp + 1, L'\0');
+    PetTextRange tr{};
+    tr.chrg.cpMin = cpStart; tr.chrg.cpMax = cpEnd;
+    tr.lpstrText = &text[0];
+    SendMessageW(edit, EM_GETTEXTRANGE, 0, (LPARAM)&tr);
+    text.resize(wcslen(text.c_str()));   // EM_GETTEXTRANGE 以 NUL 结尾
+
+    // raw 下标 → cp 之间的换算表（CR 占 2 格；紧跟其后的 LF 不额外占格）
+    std::vector<long> cpOf(text.size() + 1, cpStart);
+    long cp = cpStart;
+    for (size_t k = 0; k < text.size(); ++k) {
+        cpOf[k] = cp;
+        wchar_t c = text[k];
+        if (c == L'\r') cp += 2;
+        else if (c == L'\n') { if (k == 0 || text[k - 1] != L'\r') cp += 2; }
+        else cp += 1;
+    }
+    cpOf[text.size()] = cp;
+
+    size_t i = 0;
+    while (i < text.size()) {
+        while (i < text.size() && (text[i] == L'\r' || text[i] == L'\n')) ++i;  // 跳过空行
+        if (i >= text.size()) break;
+        size_t segEnd = i;
+        while (segEnd < text.size() && text[segEnd] != L'\r' && text[segEnd] != L'\n') ++segEnd;
+        LONG color; DWORD effects;
+        ColorForPrefix(text.substr(i, segEnd - i), color, effects);
+        ColorizeRange(edit, cpOf[i], cpOf[segEnd], color, effects);
+        i = segEnd;
+    }
+    // 上色靠"选中再设格式"，收尾时把选区收回到末尾，
+    // 否则最后一段会一直处于选中态（看起来像被高亮）。
+    long endCp = GetWindowTextLengthW(edit);
+    SendMessageW(edit, EM_SETSEL, (WPARAM)endCp, (LPARAM)endCp);
+}
+
+// 开新的一段（玩家/茉子说的每一句都算一段）
+static void AppendChatView(const std::wstring& block) {
+    if (block.empty()) return;
+    EnsureHistoryBlankLine();
+    long startCp = (g_hHistoryEdit && IsWindow(g_hHistoryEdit)) ? GetWindowTextLengthW(g_hHistoryEdit) : 0;
+    AppendHistoryText(block);
+    // 新增块按段落逐段上色（而非整块一个色）
+    if (g_hHistoryEdit && IsWindow(g_hHistoryEdit)) {
+        long endCp = GetWindowTextLengthW(g_hHistoryEdit);
+        ColorizeSpan(g_hHistoryEdit, startCp, endCp);
+    }
+}
+
+// 载入历史后整体重上色：与 AppendChatView 共用 ColorizeSpan，逻辑一致。
+static void ColorizeFullHistory() {
+    if (!g_hHistoryEdit || !IsWindow(g_hHistoryEdit)) return;
+    int len = GetWindowTextLengthW(g_hHistoryEdit);
+    if (len <= 0) return;
+    ColorizeSpan(g_hHistoryEdit, 0, (long)len);
+}
+
+// ==================================================================
+//  深色主题：RichEdit 不发送 WM_CTLCOLOREDIT，它自己绘制背景，
+//  必须用 EM_SETBKGNDCOLOR 设底色、EM_SETCHARFORMAT(SCF_ALL) 设文字色，
+//  否则历史框/输入框保持白底而文字被上成浅色，主题看起来没生效。
+// ==================================================================
+static const COLORREF kChatDarkBg = RGB(30, 30, 40);
+static const COLORREF kChatDarkFg = RGB(230, 230, 235);
+
+// 设置整个 RichEdit 的默认文字色（未被角色色覆盖的部分，如占位提示语）
+static void SetRichEditDefaultColor(HWND edit, COLORREF color) {
+    if (!edit || !IsWindow(edit)) return;
+    CHARFORMAT2W cf{};
+    cf.cbSize = sizeof(cf);
+    cf.dwMask = CFM_COLOR;
+    cf.dwEffects = 0;
+    cf.crTextColor = color;
+    // SCF_ALL 改已有文本；SCF_DEFAULT 同时设默认格式，保证空控件里新输入的字也是这个颜色
+    SendMessageW(edit, EM_SETCHARFORMAT, SCF_ALL, (LPARAM)&cf);
+    SendMessageW(edit, EM_SETCHARFORMAT, SCF_DEFAULT, (LPARAM)&cf);
+}
+
+// 把当前主题应用到聊天窗全部控件（建窗 / 切换主题 / 保存设置 时统一调用）
+static void ApplyChatTheme(HWND hwnd) {
+    const bool dark = (g_chatTheme == 1);
+    const COLORREF bg = dark ? kChatDarkBg : GetSysColor(COLOR_WINDOW);
+    const COLORREF fg = dark ? kChatDarkFg : GetSysColor(COLOR_WINDOWTEXT);
+    // 1) RichEdit 背景：唯一真正生效的途径
+    if (g_hHistoryEdit && IsWindow(g_hHistoryEdit))
+        SendMessageW(g_hHistoryEdit, EM_SETBKGNDCOLOR, 0, (LPARAM)bg);
+    if (g_hInputEdit && IsWindow(g_hInputEdit))
+        SendMessageW(g_hInputEdit, EM_SETBKGNDCOLOR, 0, (LPARAM)bg);
+    // 2) 先铺默认文字色，再按角色重上色（角色色是浅色系，深底才看得清）
+    SetRichEditDefaultColor(g_hHistoryEdit, fg);
+    SetRichEditDefaultColor(g_hInputEdit, fg);
+    ColorizeFullHistory();
+    // 3) 整体重绘（窗口边框 / 状态栏 / 按钮）
+    if (hwnd && IsWindow(hwnd)) InvalidateRect(hwnd, nullptr, TRUE);
+    if (g_hHistoryEdit && IsWindow(g_hHistoryEdit)) InvalidateRect(g_hHistoryEdit, nullptr, TRUE);
+    if (g_hInputEdit && IsWindow(g_hInputEdit)) InvalidateRect(g_hInputEdit, nullptr, TRUE);
+    if (g_hStatusLabel && IsWindow(g_hStatusLabel)) InvalidateRect(g_hStatusLabel, nullptr, TRUE);
+    if (g_hAttachStrip && IsWindow(g_hAttachStrip)) InvalidateRect(g_hAttachStrip, nullptr, TRUE);
+    if (hwnd && IsWindow(hwnd)) {
+        const int ids[] = { ID_BTN_CLEAR, ID_BTN_MEMORY, ID_BTN_LONGFORM, ID_BTN_THEME,
+            ID_BTN_ATTACH, ID_BTN_MIC, 103, 104 };
+        for (int id : ids) {
+            HWND b = GetDlgItem(hwnd, id);
+            if (b) InvalidateRect(b, nullptr, TRUE);
+        }
+    }
+}
+
+// ★深色主题下的按钮自绘：标准 PUSHBUTTON 由系统绘制，不吃 WM_CTLCOLOR，
+//   深底上会留一排浅灰按钮、看起来像"主题没生效"。
+//   所以聊天窗按钮统一改成 BS_OWNERDRAW，浅色/深色都用同一套自绘逻辑。
+static void DrawChatButton(const DRAWITEMSTRUCT* dis) {
+    if (!dis || dis->CtlType != ODT_BUTTON) return;
+    const bool dark = (g_chatTheme == 1);
+    const bool pressed = (dis->itemState & ODS_SELECTED) != 0;
+    const bool disabled = (dis->itemState & ODS_DISABLED) != 0;
+    COLORREF bg, fg, border;
+    if (dark) {
+        bg     = pressed ? RGB(62, 62, 78) : RGB(48, 48, 60);
+        fg     = disabled ? RGB(120, 120, 132) : RGB(235, 235, 242);
+        border = RGB(84, 84, 100);
+    } else {
+        bg     = pressed ? RGB(206, 206, 212) : RGB(240, 240, 243);
+        fg     = disabled ? RGB(155, 155, 155) : RGB(32, 32, 32);
+        border = RGB(188, 188, 194);
+    }
+    HBRUSH br = CreateSolidBrush(bg);
+    FillRect(dis->hDC, &dis->rcItem, br);
+    DeleteObject(br);
+    HPEN pen = CreatePen(PS_SOLID, 1, border);
+    HGDIOBJ oldPen = SelectObject(dis->hDC, pen);
+    HGDIOBJ oldBr  = SelectObject(dis->hDC, GetStockObject(NULL_BRUSH));
+    Rectangle(dis->hDC, dis->rcItem.left, dis->rcItem.top, dis->rcItem.right, dis->rcItem.bottom);
+    SelectObject(dis->hDC, oldBr);
+    SelectObject(dis->hDC, oldPen);
+    DeleteObject(pen);
+
+    wchar_t text[256] = {};
+    GetWindowTextW(dis->hwndItem, text, 255);
+    SetBkMode(dis->hDC, TRANSPARENT);
+    SetTextColor(dis->hDC, fg);
+    HFONT font = (HFONT)SendMessageW(dis->hwndItem, WM_GETFONT, 0, 0);
+    HGDIOBJ oldFont = font ? SelectObject(dis->hDC, font) : nullptr;
+    RECT rc = dis->rcItem;
+    if (pressed) OffsetRect(&rc, 0, 1);       // 按下时文字下移 1px，像真按钮
+    DrawTextW(dis->hDC, text, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    if (oldFont) SelectObject(dis->hDC, oldFont);
+    if (dis->itemState & ODS_FOCUS) DrawFocusRect(dis->hDC, &dis->rcItem);
+}
+
+// 接在当前这段的末尾（流式回复、同一条回复的后半句），收尾补一个空行
+static void AppendChatTail(const std::wstring& text) {
+    AppendHistoryText(text);
+    EnsureHistoryBlankLine();
 }
 
 static std::wstring LoadChatHistory() {
@@ -3172,46 +5852,1299 @@ static std::wstring LoadChatHistory() {
     if (n <= 0) return L"";
     std::wstring history((size_t)n, L'\0');
     MultiByteToWideChar(CP_UTF8, 0, bytes.c_str(), (int)bytes.size(), &history[0], n);
-    // RichEdit 需要 CRLF
-    size_t pos = 0;
-    while ((pos = history.find(L"\n", pos)) != std::wstring::npos) {
-        if (pos == 0 || history[pos - 1] != L'\r') { history.replace(pos, 1, L"\r\n"); pos += 2; }
-        else pos += 1;
-    }
-    return history;
+    // RichEdit 需要 CRLF；顺手把老存档里因文本模式写入多出来的空行也压掉
+    return NormalizeCrlf(history);
 }
 
 static void SaveChatHistory(const std::wstring& userInput, const std::wstring& reply) {
     std::wstring exeDir;
     if (!GetExeDir(exeDir)) return;
     std::wstring historyPath = exeDir + L"\\chat_history.txt";
+    std::wstring u = TrimBlock(userInput);
+    std::wstring r = TrimBlock(reply);
+    if (u.empty() && r.empty()) return;
+    std::lock_guard<std::recursive_mutex> lk(g_historyFileMtx);
+    // 一段一轮，段内 CRLF、段间空行；换行在这里就规范化好，
+    // 下次读档显示才会和当时看到的一模一样。
+    std::wstring record = L"主人：" + u + L"\r\n\r\n" + L"茉子：" + r + L"\r\n\r\n";
+    std::string utf8 = WideStringToUtf8(record);
+    // 用二进制模式写字节：UTF-8 文本模式下 CRT 会再次翻译 \r\n，
+    // 读回变成 \r\r\n，导致空行忽多忽少。
     FILE* f = nullptr;
-    _wfopen_s(&f, historyPath.c_str(), L"a, ccs=UTF-8");
-    if (f) {
-        std::wstring record = L"主人：" + userInput + L"\r\n\r\n" + L"茉子：" + reply + L"\r\n\r\n";
-#pragma warning(suppress:6031)                      // 写失败不影响主流程
-        fwrite(record.c_str(), sizeof(wchar_t), record.length(), f);
-        fclose(f);
+    _wfopen_s(&f, historyPath.c_str(), L"ab");
+    if (!f) return;
+    _fseeki64(f, 0, SEEK_END);
+    if (_ftelli64(f) == 0) {                       // 新文件补 BOM，读档时会剥掉
+        const unsigned char bom[3] = { 0xEF, 0xBB, 0xBF };
+        fwrite(bom, 1, sizeof bom, f);
+    }
+#pragma warning(suppress:6031)                     // 写失败不影响主流程
+    fwrite(utf8.data(), 1, utf8.size(), f);
+    fclose(f);
+    // 周期性触发历史滚动归档（每 50 轮检查一次，避免频繁 stat）
+    {
+        static std::atomic<int> s_archiveTick{ 0 };
+        if (++s_archiveTick >= 50) { s_archiveTick = 0; ArchiveHistoryIfLarge(); }
     }
 }
 
-struct LLMThreadParam { HWND hwnd; std::wstring input; };
+// 当前触摸的旁白：LLM 回复到达时，用它和回复配对写入 chat_history。
+// DoBodyTouch 有 g_touchRunning 互斥，同一时刻只有一个触摸在途，用全局变量即可。
+static std::wstring g_touchPendingNarration;
+// ★ 本轮的玩家发言：回复到达时直接用它配对写盘。
+//   回复到达时直接用它配对写盘；从控件全文 rfind("主人：") 反推，
+//   会因模型在回话里喊"主人："而错位。
+static std::wstring g_pendingUserInput;
+
+// 会话序号：每次发起聊天请求时 ++，投递到 UI 的消息带上该 id。
+//   主线程（聊天窗）只接受等于"当前期望序号"的回复，晚到/作废的旧回复被丢弃，
+//   避免"触摸超时兜底复位后旧线程还在跑、晚到的回复写进历史"或"窗口重建后旧流串进来"。
+static std::atomic<int> g_chatSessionSeq{ 0 };        // 全局递增的会话序号
+static std::atomic<int> g_chatExpectedSession{ 0 };   // 聊天窗当前应显示的会话
+
+// ==================================================================
+// 长期记忆：把茉子记住的"关于主人的事实"沉淀到 memory.txt，
+// 每次对话注入 prompt，让她记得你说过的话、喜好、称呼、纪念日。
+// 与 chat_history（逐轮对话流）不同，memory 是提炼后的稳定事实，条目少而精。
+// 设计要点：去重（新事实覆盖同关键词旧条目）、有条数上限（防止无限膨胀）。
+// ==================================================================
+#define MEMORY_MAX_LINES  60      // 最多 60 条事实，超出丢弃最旧的
+#define MEMORY_MAX_CHARS  4000    // 注入 prompt 的记忆文本上限
+
+// 读取全部记忆（UTF-8 -> wstring），返回已规范化的行数组。
+static std::vector<std::wstring> LoadMemoryLines() {
+    std::vector<std::wstring> lines;
+    std::wstring exeDir;
+    if (!GetExeDir(exeDir)) return lines;
+    std::wstring path = exeDir + L"\\memory.txt";
+    if (!PathFileExistsW(path.c_str())) return lines;
+    FILE* f = nullptr;
+    _wfopen_s(&f, path.c_str(), L"rb");
+    if (!f) return lines;
+    std::string bytes;
+    char buf[4096]; size_t n;
+    while ((n = fread(buf, 1, sizeof buf, f)) > 0) bytes.append(buf, n);
+    fclose(f);
+    // 去 BOM
+    if (bytes.size() >= 3 && (unsigned char)bytes[0] == 0xEF &&
+        (unsigned char)bytes[1] == 0xBB && (unsigned char)bytes[2] == 0xBF) bytes.erase(0, 3);
+    int nch = MultiByteToWideChar(CP_UTF8, 0, bytes.c_str(), (int)bytes.size(), nullptr, 0);
+    if (nch <= 0) return lines;
+    std::wstring all((size_t)nch, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, bytes.c_str(), (int)bytes.size(), &all[0], nch);
+    size_t start = 0;
+    while (start <= all.size()) {
+        size_t e = all.find(L'\n', start);
+        if (e == std::wstring::npos) e = all.size();
+        std::wstring line = all.substr(start, e - start);
+        if (!line.empty() && line.back() == L'\r') line.pop_back();
+        if (!line.empty()) lines.push_back(line);
+        if (e == all.size()) break;
+        start = e + 1;
+    }
+    return lines;
+}
+
+// ==================================================================
+// 长期记忆增强：
+//   1) 近似去重：新事实与旧条目互为"长短句包含关系"或"共享 3 字以上关键词"
+//      时，视为同一事实，不再写入（避免"喜欢猫"/"很喜欢猫咪"重复占配额）。
+//   2) 主题标签替换：带 [主题] 前缀的条目（如 [称呼]），同主题新事实替换旧条目，
+//      称呼改了旧的不留。无标签的新事实在与旧条目近似时直接覆盖最接近那条。
+//   3) 写入时间戳：每行尾追加 " @<unix秒>"，超期（默认 180 天）低价值条目
+//      （无 [高] 标签）自动淘汰，防止记忆越用越满越乱。
+//   兼容性：老文件没有标签/时间戳也能读，写入时补上。
+// ==================================================================
+// 取一条事实的"主题标签"：开头形如 [xxx] 的部分，没有则返回空。
+static std::wstring MemTopicTag(const std::wstring& fact) {
+    if (fact.empty() || fact[0] != L'[') return L"";
+    size_t e = fact.find(L']');
+    if (e == std::wstring::npos || e > 8) return L"";
+    return fact.substr(1, e - 1);
+}
+// 是否"高价值"条目（带 [高] 标签）：淘汰时优先保留
+static bool MemHighValue(const std::wstring& fact) {
+    std::wstring t = MemTopicTag(fact);
+    return (t == L"高");
+}
+// 近似去重判定：去空白/标点后的两个事实，互相包含或共享 3+ 字符公共子串片段。
+//   用"字符 n-gram 集合交集"近似衡量语义相似度，简单且够覆盖"猫/猫咪"这类。
+static bool MemSimilar(const std::wstring& a, const std::wstring& b) {
+    if (a == b) return true;
+    // 归一化：小写 + 去空白
+    auto norm = [](std::wstring s) {
+        for (auto& c : s) if (IsBlankChar(c)) c = L' ';
+        while (s.find(L"  ") != std::wstring::npos) s.erase(s.find(L"  "), 1);
+        return s;
+    };
+    std::wstring na = norm(a), nb = norm(b);
+    if (na.find(nb) != std::wstring::npos || nb.find(na) != std::wstring::npos) return true;
+    // 取 a 的所有 3-gram 集合，统计 b 中命中比例；>= 40% 视为近似
+    std::wstring grams;
+    for (size_t i = 0; i + 3 <= na.size(); ++i) {
+        std::wstring g = na.substr(i, 3);
+        if (nb.find(g) != std::wstring::npos) grams += g;
+    }
+    size_t total = na.size() >= 3 ? na.size() - 2 : 1;
+    if (total == 0) return false;
+    double ratio = (double)grams.size() / ((double)total * 3.0);
+    return ratio >= 0.4;
+}
+
+// 写入一条新记忆：近似去重 + 主题替换 + 时间戳，超上限截断最旧（高价值条目保护）。
+// 走内存缓存：读缓存 -> 改 -> 写盘 -> 同步回缓存，避免每轮全量读盘。
+static void AppendMemoryLine(const std::wstring& fact) {
+    if (fact.empty()) return;
+    std::wstring exeDir;
+    if (!GetExeDir(exeDir)) return;
+    std::wstring path = exeDir + L"\\memory.txt";
+    auto lines = GetMemoryCache();
+
+    // 给新事实加时间戳（若还没有）
+    SYSTEMTIME st; GetLocalTime(&st);
+    ULARGE_INTEGER ticks; GetSystemTimeAsFileTime((FILETIME*)&ticks);
+    unsigned long long unixSec = ticks.QuadPart / 10000000ull - 11644473600ull;
+    std::wstring tagged = fact;
+    if (tagged.find(L" @") == std::wstring::npos)
+        tagged += L" @" + std::to_wstring(unixSec);
+
+    // ① 近似去重 + ② 主题替换：找到"该被替换"的旧条目下标，找不到则 -1
+    int replaceIdx = -1;
+    std::wstring newTag = MemTopicTag(tagged);
+    for (size_t i = 0; i < lines.size(); ++i) {
+        if (newTag.empty()) {
+            // 无标签新事实：与任何近似旧条目都不再重复写；若近似则覆盖最旧那条
+            if (MemSimilar(tagged, lines[i])) { replaceIdx = (int)i; break; }
+        } else {
+            // 有主题标签：同主题旧条目直接被新事实替换（称呼改了不留旧的）
+            if (MemTopicTag(lines[i]) == newTag && !MemHighValue(tagged)) {
+                replaceIdx = (int)i; break;
+            }
+            // 同主题但新事实是"高"价值：保留新的，仍替换旧
+            if (MemTopicTag(lines[i]) == newTag) { replaceIdx = (int)i; break; }
+        }
+    }
+    if (replaceIdx >= 0)
+        lines[replaceIdx] = tagged;               // 替换
+    else
+        lines.push_back(tagged);                  // 全新
+
+    // ③ 时间戳淘汰：超期低价值条目移除（高价值条目保护）
+    unsigned long long nowSec = unixSec;
+    int expireDays = GetLLMConfigInt(L"MemoryExpireDays", 180, 0, 3650);
+    if (expireDays > 0) {
+        unsigned long long cutoff = nowSec - (unsigned long long)expireDays * 86400ull;
+        size_t w = 0;
+        for (size_t i = 0; i < lines.size(); ++i) {
+            auto& l = lines[i];
+            bool keep = true;
+            if (!MemHighValue(l)) {
+                size_t at = l.rfind(L" @");
+                if (at != std::wstring::npos) {
+                    unsigned long long ts = 0;
+                    try { ts = std::stoull(l.substr(at + 2)); } catch (...) {}
+                    if (ts > 0 && ts < cutoff) keep = false;
+                }
+            }
+            if (keep) { lines[w++] = l; }
+        }
+        lines.resize(w);
+    }
+
+    // 超上限截断最旧的（从头部丢），但保护最近 5 条高价值条目
+    while ((int)lines.size() > MEMORY_MAX_LINES) {
+        int rm = -1;
+        for (int i = (int)lines.size() - 1; i >= 0; --i)
+            if (!MemHighValue(lines[i]) || (int)i < 5) { rm = i; break; }
+        if (rm < 0) rm = 0;
+        lines.erase(lines.begin() + rm);
+    }
+
+    FILE* f = nullptr;
+    _wfopen_s(&f, path.c_str(), L"w, ccs=UTF-8");
+    if (!f) return;
+    for (const auto& l : lines) {
+        std::wstring rec = l + L"\r\n";
+        fwrite(rec.c_str(), sizeof(wchar_t), rec.length(), f);
+    }
+    fclose(f);
+    // 写盘成功 -> 同步内存缓存，下一轮 BuildMemoryContext 直接读缓存
+    {
+        std::lock_guard<std::mutex> lk(g_memoryCacheMtx);
+        g_memoryCache = lines;
+        g_memoryCacheLoaded = true;
+    }
+}
+
+// 拼接成一段可注入 prompt 的记忆文本（带上限，倒序取最近的）。
+// 走内存缓存，AppendMemoryLine 写时同步刷新，避免每轮全量读盘。
+static std::wstring BuildMemoryContext() {
+    auto lines = GetMemoryCache();
+    if (lines.empty()) return L"";
+    std::wstring out;
+    for (int i = (int)lines.size() - 1; i >= 0; --i) {
+        std::wstring piece = L"- " + lines[i] + L"\n";
+        if (out.size() + piece.size() > MEMORY_MAX_CHARS) break;
+        out += piece;
+    }
+    return out;
+}
+
+// 记忆缓存失效（外部改动 memory.txt / 程序启动后）调用。
+static void InvalidateMemoryCache() {
+    std::lock_guard<std::mutex> lk(g_memoryCacheMtx);
+    g_memoryCache.clear();
+    g_memoryCacheLoaded = false;
+}
+
+// ==================================================================
+//  ★附件中枢（图片 / 文本 / PDF·DOCX·XLSX / 语音转写）
+//  ------------------------------------------------------------------
+//  设计要点：
+//   · 附件只活在"待发送队列"里，发送后立刻清空；base64 绝不写进
+//     chat_history.txt（否则历史文件几十 MB、启动变慢还泄露隐私）。
+//   · 历史里只留一行占位符，如「[图片 photo.jpg]」。
+//   · 无附件时请求体仍是原来的字符串 content，对老网关 100% 兼容。
+//   · 图片统一缩到最长边 ImageMaxSide（默认 1280）再转 JPEG q85，
+//     一张手机照片从 4MB 压到 200KB 左右，视觉问答完全够用。
+// ==================================================================
+#define ATTACH_MAX_FILES       8
+#define ATTACH_MAX_BYTES       (20u * 1024u * 1024u)   // 单文件硬上限
+#define ATTACH_IMG_MAX_BYTES   (8u  * 1024u * 1024u)   // 图片单张上限
+#define ATTACH_TEXT_MAX_BYTES  (2u  * 1024u * 1024u)   // 文本类上限
+#define ATTACH_KIND_IMAGE 0
+#define ATTACH_KIND_TEXT  1
+#define ATTACH_KIND_VOICE 2
+
+struct Attachment {
+    int          kind = ATTACH_KIND_IMAGE;
+    std::wstring path;          // 原始路径（剪贴板图片为空）
+    std::wstring name;          // 显示名 / 历史占位符用
+    std::wstring text;          // 文本类提取结果 / 语音转写
+    std::string  b64;           // 图片 JPEG 的 base64
+    std::string  mime;          // image/jpeg
+    size_t       bytes = 0;     // 原始字节数
+    bool         ok = false;    // 处理成功标记
+};
+
+static std::vector<Attachment> g_pendingAttachments;   // 仅主线程访问
+static void RefreshAttachStrip();                      // UI 层实现（附件条显隐/重绘）
+
+// ---------------- 基础工具 ----------------
+
+static std::string Base64Encode(const unsigned char* data, size_t len) {
+    static const char tbl[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    if (!data || len == 0) return out;
+    out.resize(((len + 2) / 3) * 4);
+    size_t o = 0;
+    for (size_t i = 0; i < len; i += 3) {
+        unsigned v = (unsigned)data[i] << 16;
+        if (i + 1 < len) v |= (unsigned)data[i + 1] << 8;
+        if (i + 2 < len) v |= (unsigned)data[i + 2];
+        out[o++] = tbl[(v >> 18) & 63];
+        out[o++] = tbl[(v >> 12) & 63];
+        out[o++] = (i + 1 < len) ? tbl[(v >> 6) & 63] : '=';
+        out[o++] = (i + 2 < len) ? tbl[v & 63] : '=';
+    }
+    return out;
+}
+
+// GDI+ 编码器 CLSID 查找（JPEG/PNG 都要先拿到 CLSID 才能 Save 到流）
+static bool GetEncoderClsid(const wchar_t* mime, CLSID* out) {
+    UINT num = 0, size = 0;
+    if (GetImageEncodersSize(&num, &size) != Ok || size == 0) return false;
+    std::vector<BYTE> buf(size);
+    ImageCodecInfo* codecs = (ImageCodecInfo*)buf.data();
+    if (GetImageEncoders(num, size, codecs) != Ok) return false;
+    for (UINT i = 0; i < num; ++i) {
+        if (wcscmp(codecs[i].MimeType, mime) == 0) { *out = codecs[i].Clsid; return true; }
+    }
+    return false;
+}
+
+// 把任意 GDI+ 位图缩放到最长边 maxSide，编码成 JPEG(q85) 的 base64
+static bool EncodeBitmapToJpegBase64(Bitmap* src, int maxSide, std::string& outB64) {
+    outB64.clear();
+    if (!src || src->GetLastStatus() != Ok) return false;
+    UINT w = src->GetWidth(), h = src->GetHeight();
+    if (w == 0 || h == 0) return false;
+    UINT longSide = (w > h) ? w : h;
+    double scale = 1.0;
+    if (maxSide > 0 && (int)longSide > maxSide) scale = (double)maxSide / (double)longSide;
+    int nw = (int)(w * scale + 0.5); if (nw < 1) nw = 1;
+    int nh = (int)(h * scale + 0.5); if (nh < 1) nh = 1;
+
+    Bitmap* dst = new Bitmap(nw, nh, PixelFormat24bppRGB);
+    if (!dst || dst->GetLastStatus() != Ok) { delete dst; return false; }
+    {
+        Graphics g(dst);
+        g.SetInterpolationMode(InterpolationModeHighQualityBicubic);
+        g.SetPixelOffsetMode(PixelOffsetModeHighQuality);
+        // PNG 的透明区直接转 JPEG 会变黑，先铺白底
+        g.Clear(Color(255, 255, 255, 255));
+        g.DrawImage(src, Rect(0, 0, nw, nh), 0, 0, (int)w, (int)h, UnitPixel);
+    }
+
+    CLSID jpgClsid;
+    bool ok = false;
+    if (GetEncoderClsid(L"image/jpeg", &jpgClsid)) {
+        EncoderParameters ep;
+        ep.Count = 1;
+        ep.Parameter[0].Guid = EncoderQuality;
+        ep.Parameter[0].Type = EncoderParameterValueTypeLong;
+        ep.Parameter[0].NumberOfValues = 1;
+        LONG quality = 85;
+        ep.Parameter[0].Value = &quality;
+        IStream* stm = nullptr;
+        if (CreateStreamOnHGlobal(nullptr, TRUE, &stm) == S_OK && stm) {
+            if (dst->Save(stm, &jpgClsid, &ep) == Ok) {
+                STATSTG ss{};
+                if (stm->Stat(&ss, STATFLAG_NONAME) == S_OK && ss.cbSize.QuadPart > 0) {
+                    HGLOBAL hg = nullptr;
+                    if (GetHGlobalFromStream(stm, &hg) == S_OK && hg) {
+                        void* p = GlobalLock(hg);
+                        if (p) {
+                            outB64 = Base64Encode((const unsigned char*)p, (size_t)ss.cbSize.QuadPart);
+                            GlobalUnlock(hg);
+                            ok = !outB64.empty();
+                        }
+                    }
+                }
+            }
+            stm->Release();
+        }
+    }
+    delete dst;
+    return ok;
+}
+
+// 读取整个文件（超过 maxBytes 只读前面部分）
+static bool ReadWholeFileBytes(const std::wstring& path, size_t maxBytes, std::string& out) {
+    out.clear();
+    FILE* f = nullptr;
+    _wfopen_s(&f, path.c_str(), L"rb");
+    if (!f) return false;
+    _fseeki64(f, 0, SEEK_END);
+    long long sz = _ftelli64(f);
+    _fseeki64(f, 0, SEEK_SET);
+    if (sz < 0) { fclose(f); return false; }
+    if ((size_t)sz > maxBytes) sz = (long long)maxBytes;
+    out.resize((size_t)sz);
+    size_t rd = (sz > 0) ? fread(&out[0], 1, (size_t)sz, f) : 0;
+    fclose(f);
+    out.resize(rd);
+    return true;
+}
+
+// 文本编码探测：UTF-8 BOM / UTF-16LE BOM / 严格 UTF-8 / 回退 ANSI(GBK)
+static std::wstring DecodeTextBytes(const std::string& raw) {
+    if (raw.empty()) return L"";
+    const unsigned char* p = (const unsigned char*)raw.data();
+    size_t n = raw.size();
+    if (n >= 3 && p[0] == 0xEF && p[1] == 0xBB && p[2] == 0xBF) {
+        int wl = MultiByteToWideChar(CP_UTF8, 0, raw.data() + 3, (int)(n - 3), nullptr, 0);
+        std::wstring w((size_t)(wl > 0 ? wl : 0), L'\0');
+        if (wl > 0) MultiByteToWideChar(CP_UTF8, 0, raw.data() + 3, (int)(n - 3), &w[0], wl);
+        return w;
+    }
+    if (n >= 2 && p[0] == 0xFF && p[1] == 0xFE) {
+        size_t cnt = (n - 2) / 2;
+        std::wstring w(cnt, L'\0');
+        if (cnt) memcpy(&w[0], raw.data() + 2, cnt * 2);
+        return w;
+    }
+    int wl = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, raw.data(), (int)n, nullptr, 0);
+    if (wl <= 0) wl = MultiByteToWideChar(CP_ACP, 0, raw.data(), (int)n, nullptr, 0);
+    if (wl <= 0) return L"";
+    std::wstring w((size_t)wl, L'\0');
+    UINT cp = (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, raw.data(), (int)n, nullptr, 0) > 0)
+        ? CP_UTF8 : CP_ACP;
+    MultiByteToWideChar(cp, 0, raw.data(), (int)n, &w[0], wl);
+    return w;
+}
+
+static void ReplaceAllInPlace(std::string& s, const std::string& from, const std::string& to) {
+    if (from.empty()) return;
+    size_t pos = 0;
+    while ((pos = s.find(from, pos)) != std::string::npos) {
+        s.replace(pos, from.size(), to);
+        pos += to.size();
+    }
+}
+
+static void AppendUtf8Codepoint(std::string& s, unsigned cp) {
+    if (cp < 0x80) s += (char)cp;
+    else if (cp < 0x800) {
+        s += (char)(0xC0 | (cp >> 6));
+        s += (char)(0x80 | (cp & 0x3F));
+    } else if (cp < 0x10000) {
+        s += (char)(0xE0 | (cp >> 12));
+        s += (char)(0x80 | ((cp >> 6) & 0x3F));
+        s += (char)(0x80 | (cp & 0x3F));
+    } else {
+        s += (char)(0xF0 | (cp >> 18));
+        s += (char)(0x80 | ((cp >> 12) & 0x3F));
+        s += (char)(0x80 | ((cp >> 6) & 0x3F));
+        s += (char)(0x80 | (cp & 0x3F));
+    }
+}
+
+// OOXML → 纯文本：段落/换行标签变 \n，剥掉所有标签，解实体
+static std::string XmlToPlainText(const std::string& xml) {
+    std::string s = xml;
+    const char* breaks[] = { "</w:p>", "</a:p>", "<w:br/>", "<w:br />",
+                             "</w:tr>", "</w:tab/>", "</si>" };
+    for (const char* b : breaks) ReplaceAllInPlace(s, b, "\n");
+    std::string out;
+    out.reserve(s.size());
+    bool inTag = false;
+    for (char c : s) {
+        if (c == '<') { inTag = true; continue; }
+        if (c == '>') { inTag = false; continue; }
+        if (!inTag) out += c;
+    }
+    ReplaceAllInPlace(out, "&lt;", "<");
+    ReplaceAllInPlace(out, "&gt;", ">");
+    ReplaceAllInPlace(out, "&quot;", "\"");
+    ReplaceAllInPlace(out, "&apos;", "'");
+    ReplaceAllInPlace(out, "&amp;", "&");     // 必须最后做，避免二次解码
+    // 数字实体 &#123; / &#x1F600;
+    for (size_t i = 0; i + 3 < out.size();) {
+        if (out[i] == '&' && out[i + 1] == '#') {
+            size_t semi = out.find(';', i + 2);
+            if (semi != std::string::npos && semi - i <= 10) {
+                std::string num = out.substr(i + 2, semi - i - 2);
+                unsigned cp = 0;
+                if (!num.empty() && (num[0] == 'x' || num[0] == 'X'))
+                    cp = (unsigned)strtoul(num.c_str() + 1, nullptr, 16);
+                else
+                    cp = (unsigned)strtoul(num.c_str(), nullptr, 10);
+                if (cp > 0) {
+                    std::string rep;
+                    AppendUtf8Codepoint(rep, cp);
+                    out.replace(i, semi - i + 1, rep);
+                    i += rep.size();
+                    continue;
+                }
+            }
+        }
+        ++i;
+    }
+    // 压掉连续 3 个以上换行
+    while (out.find("\n\n\n") != std::string::npos) ReplaceAllInPlace(out, "\n\n\n", "\n\n");
+    return out;
+}
+
+// 隐藏窗口跑外部程序（tar / pdftotext / whisper），带超时强杀
+static bool RunHiddenProcess(const std::wstring& cmdLine, DWORD timeoutMs, DWORD* exitCode) {
+    if (exitCode) *exitCode = 1;
+    if (cmdLine.empty()) return false;
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi{};
+    std::wstring cmd = cmdLine;                 // CreateProcessW 要求可写缓冲
+    if (!CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, FALSE,
+        CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi))
+        return false;
+    DWORD wr = WaitForSingleObject(pi.hProcess, timeoutMs);
+    bool finished = (wr != WAIT_TIMEOUT);
+    if (!finished) {
+        TerminateProcess(pi.hProcess, 1);
+        WaitForSingleObject(pi.hProcess, 2000);
+    }
+    DWORD ec = 1;
+    GetExitCodeProcess(pi.hProcess, &ec);
+    if (exitCode) *exitCode = ec;
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return finished;
+}
+
+// 建一个本次专用的临时目录：%TEMP%\MakotoPetAttach\<pid>_<tick>
+static std::wstring MakeTempDir() {
+    wchar_t tmp[MAX_PATH] = { 0 };
+    if (GetTempPathW(MAX_PATH, tmp) == 0) return L"";
+    std::wstring base = std::wstring(tmp) + L"MakotoPetAttach";
+    CreateDirectoryW(base.c_str(), nullptr);
+    // ★同一毫秒内可能连续调用（OCR 转图 + docx 解包），只用 pid+tick 会撞名导致
+    //   CreateDirectory 失败、整条解析链报"创建临时目录失败"。加自增序号 + 重试。
+    static std::atomic<unsigned> s_seq{ 0 };
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        unsigned seq = s_seq.fetch_add(1);
+        wchar_t sub[96];
+        _snwprintf_s(sub, 96, _TRUNCATE, L"\\%lu_%llu_%u",
+            (unsigned long)GetCurrentProcessId(), (unsigned long long)GetTickCount64(), seq);
+        std::wstring dir = base + sub;
+        if (CreateDirectoryW(dir.c_str(), nullptr)) return dir;
+    }
+    return L"";
+}
+
+// 只删自己创建的临时树（绝不碰用户目录）
+static void CleanupTempTree(const std::wstring& dir) {
+    if (dir.size() < 10) return;                 // 防御：路径过短直接放弃
+    std::wstring pattern = dir + L"\\*";
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+            std::wstring p = dir + L"\\" + fd.cFileName;
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) CleanupTempTree(p);
+            else DeleteFileW(p.c_str());
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    RemoveDirectoryW(dir.c_str());
+}
+
+// 在 程序目录 / 程序目录\tools / PATH 里找一个外部工具
+static bool FindToolExe(const wchar_t* exeName, std::wstring& outPath) {
+    std::wstring dir;
+    if (GetExeDir(dir)) {
+        std::wstring p = dir + L"\\" + exeName;
+        if (PathFileExistsW(p.c_str())) { outPath = p; return true; }
+        p = dir + L"\\tools\\" + exeName;
+        if (PathFileExistsW(p.c_str())) { outPath = p; return true; }
+    }
+    wchar_t buf[MAX_PATH] = { 0 };
+    if (SearchPathW(nullptr, exeName, nullptr, MAX_PATH, buf, nullptr) > 0) {
+        outPath = buf;
+        return true;
+    }
+    return false;
+}
+
+static bool ExtractDocxText(const std::wstring& path, std::wstring& out, std::wstring& err) {
+    std::wstring tmp = MakeTempDir();
+    if (tmp.empty()) { err = L"创建临时目录失败"; return false; }
+    wchar_t sys[MAX_PATH] = { 0 };
+    GetSystemDirectoryW(sys, MAX_PATH);
+    std::wstring tar = std::wstring(sys) + L"\\tar.exe";
+    bool ok = false;
+    if (!PathFileExistsW(tar.c_str())) {
+        err = L"系统缺少 tar.exe（Win10 1803+ 自带），无法解析 docx";
+    } else {
+        std::wstring cmd = L"\"" + tar + L"\" -x -f \"" + path + L"\" -C \"" + tmp + L"\" word/document.xml";
+        DWORD ec = 1;
+        if (RunHiddenProcess(cmd, 15000, &ec) && ec == 0) {
+            std::string xml;
+            std::wstring doc = tmp + L"\\word\\document.xml";
+            if (ReadWholeFileBytes(doc, 32u * 1024u * 1024u, xml) && !xml.empty()) {
+                out = Utf8ToWideString(XmlToPlainText(xml));
+                ok = !out.empty();
+                if (!ok) err = L"docx 里没有可用文字（可能只有图片）";
+            } else {
+                err = L"docx 解包后没有 document.xml";
+            }
+        } else {
+            err = L"docx 解包失败（文件可能损坏或被加密）";
+        }
+    }
+    CleanupTempTree(tmp);
+    return ok;
+}
+
+static std::vector<std::wstring> ParseSharedStrings(const std::string& xml) {
+    std::vector<std::wstring> v;
+    size_t pos = 0;
+    while ((pos = xml.find("<si>", pos)) != std::string::npos) {
+        size_t end = xml.find("</si>", pos);
+        if (end == std::string::npos) break;
+        std::string inner = xml.substr(pos + 4, end - pos - 4);
+        v.push_back(Utf8ToWideString(XmlToPlainText(inner)));
+        pos = end + 5;
+    }
+    return v;
+}
+
+// sheet XML → 每行制表符分隔的纯文本（够模型读懂表格内容）
+static void ParseSheetXml(const std::string& xml, const std::vector<std::wstring>& shared,
+    std::wstring& out, size_t maxChars) {
+    size_t pos = 0;
+    while ((pos = xml.find("<row", pos)) != std::string::npos) {
+        size_t rowEnd = xml.find("</row>", pos);
+        if (rowEnd == std::string::npos) break;
+        std::string row = xml.substr(pos, rowEnd - pos);
+        std::wstring line;
+        size_t cp = 0;
+        while ((cp = row.find("<c", cp)) != std::string::npos) {
+            size_t cEnd = row.find("</c>", cp);
+            if (cEnd == std::string::npos) break;
+            std::string cell = row.substr(cp, cEnd - cp);
+            bool isShared = cell.find("t=\"s\"") != std::string::npos;
+            std::wstring val;
+            size_t vp = cell.find("<v>");
+            if (vp != std::string::npos) {
+                size_t ve = cell.find("</v>", vp);
+                if (ve != std::string::npos) {
+                    std::string num = cell.substr(vp + 3, ve - vp - 3);
+                    if (isShared) {
+                        int idx = atoi(num.c_str());
+                        if (idx >= 0 && idx < (int)shared.size()) val = shared[(size_t)idx];
+                    } else {
+                        val = Utf8ToWideString(num);
+                    }
+                }
+            } else {
+                val = Utf8ToWideString(XmlToPlainText(cell));
+            }
+            if (!val.empty()) {
+                if (!line.empty()) line += L'\t';
+                line += val;
+            }
+            cp = cEnd + 4;
+        }
+        if (!line.empty()) { out += line; out += L'\n'; }
+        if (out.size() > maxChars) break;
+        pos = rowEnd + 6;
+    }
+}
+
+static bool ExtractXlsxText(const std::wstring& path, std::wstring& out, std::wstring& err) {
+    std::wstring tmp = MakeTempDir();
+    if (tmp.empty()) { err = L"创建临时目录失败"; return false; }
+    wchar_t sys[MAX_PATH] = { 0 };
+    GetSystemDirectoryW(sys, MAX_PATH);
+    std::wstring tar = std::wstring(sys) + L"\\tar.exe";
+    bool ok = false;
+    if (!PathFileExistsW(tar.c_str())) {
+        err = L"系统缺少 tar.exe（Win10 1803+ 自带），无法解析 xlsx";
+    } else {
+        // 分两次解：sharedStrings.xml 在纯数字表里可能不存在，
+        // 合在一条命令里 tar 会整体报错，连 sheet1 都解不出来。
+        std::wstring cmdSs = L"\"" + tar + L"\" -x -f \"" + path + L"\" -C \"" + tmp +
+            L"\" xl/sharedStrings.xml";
+        std::wstring cmdSheet = L"\"" + tar + L"\" -x -f \"" + path + L"\" -C \"" + tmp +
+            L"\" xl/worksheets/sheet1.xml";
+        DWORD ec = 1;
+        RunHiddenProcess(cmdSs, 15000, &ec);        // 可能没有，忽略退出码
+        RunHiddenProcess(cmdSheet, 15000, &ec);
+        std::string ssXml, sheetXml;
+        ReadWholeFileBytes(tmp + L"\\xl\\sharedStrings.xml", 32u * 1024u * 1024u, ssXml);
+        if (!ReadWholeFileBytes(tmp + L"\\xl\\worksheets\\sheet1.xml", 32u * 1024u * 1024u, sheetXml)) {
+            err = L"xlsx 里没有 sheet1（多工作表时请另存为 csv）";
+        } else {
+            std::vector<std::wstring> shared = ParseSharedStrings(ssXml);
+            std::wstring body;
+            ParseSheetXml(sheetXml, shared, body, 400000);
+            if (!body.empty()) {
+                out = L"[工作表 sheet1]\n" + body;
+                ok = true;
+            } else {
+                err = L"xlsx 里没有可读的单元格文本";
+            }
+        }
+    }
+    CleanupTempTree(tmp);
+    return ok;
+}
+
+// ==================================================================
+//  ★扫描件 OCR：走系统自带的 WinRT OCR（Windows.Media.Ocr），零额外下载。
+//   PDF 没有文字层时：pdftoppm 把前 N 页转成 PNG → 逐页 OCR → 拼成文本。
+//   注意：WinRT 异步在 MTA 线程完成，UI 线程若是 STA 会被卡死，
+//   所以整条 OCR 链路放进独立线程（里面自己 RoInitialize(MTA)）。
+// ==================================================================
+namespace ocrwin {
+
+using namespace ABI::Windows::Foundation;
+using namespace ABI::Windows::Storage;
+using namespace ABI::Windows::Storage::Streams;
+using namespace ABI::Windows::Graphics::Imaging;
+using namespace ABI::Windows::Media::Ocr;
+using Microsoft::WRL::ComPtr;
+
+static HRESULT WaitAsyncInfo(IAsyncInfo* info, DWORD timeoutMs) {
+    if (!info) return E_POINTER;
+    ULONGLONG t0 = GetTickCount64();
+    for (;;) {
+        AsyncStatus st = AsyncStatus::Started;
+        HRESULT hr = info->get_Status(&st);
+        if (FAILED(hr)) return hr;
+        if (st != AsyncStatus::Started)
+            return (st == AsyncStatus::Completed) ? S_OK : E_FAIL;
+        if (GetTickCount64() - t0 > timeoutMs) return HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+        Sleep(10);
+    }
+}
+
+// WinRT 的 AggregateType 要求 GetResults 收"接口指针"，所以接口类型单独作模板参数
+template <typename TAsync, typename TIface>
+static HRESULT AwaitOp(IAsyncOperation<TAsync>* op, ComPtr<TIface>& out, DWORD timeoutMs) {
+    if (!op) return E_POINTER;
+    ComPtr<IAsyncInfo> info;
+    HRESULT hr = op->QueryInterface(__uuidof(IAsyncInfo), (void**)info.GetAddressOf());
+    if (FAILED(hr)) return hr;
+    hr = WaitAsyncInfo(info.Get(), timeoutMs);
+    if (FAILED(hr)) return hr;
+    TIface* raw = nullptr;
+    hr = op->GetResults(&raw);
+    if (FAILED(hr)) return hr;
+    if (!raw) return E_FAIL;
+    out.Attach(raw);
+    return S_OK;
+}
+
+template <typename T>
+static HRESULT GetStatics(const wchar_t* cls, REFIID iid, T** out) {
+    HSTRING hs = nullptr;
+    HRESULT hr = WindowsCreateString(cls, (UINT32)wcslen(cls), &hs);
+    if (FAILED(hr)) return hr;
+    ComPtr<IActivationFactory> f;
+    hr = RoGetActivationFactory(hs, __uuidof(IActivationFactory), (void**)f.GetAddressOf());
+    WindowsDeleteString(hs);
+    if (FAILED(hr)) return hr;
+    return f->QueryInterface(iid, (void**)out);
+}
+
+// 识别一张图（PNG/JPG 都行）。调用线程必须已 RoInitialize。
+static bool RecognizeFile(const std::wstring& path, std::wstring& out) {
+    out.clear();
+    ComPtr<IOcrEngineStatics> engStatics;
+    if (FAILED(GetStatics(L"Windows.Media.Ocr.OcrEngine", __uuidof(IOcrEngineStatics),
+                          (void**)engStatics.GetAddressOf())))
+        return false;
+
+    ComPtr<IOcrEngine> engine;
+    if (FAILED(engStatics->TryCreateFromUserProfileLanguages(engine.GetAddressOf())) || !engine)
+        return false;
+
+    ComPtr<IStorageFileStatics> fileStatics;
+    if (FAILED(GetStatics(L"Windows.Storage.StorageFile", __uuidof(IStorageFileStatics),
+                          (void**)fileStatics.GetAddressOf())))
+        return false;
+
+    ComPtr<IStorageFile> file;
+    {
+        HSTRING hp = nullptr;
+        WindowsCreateString(path.c_str(), (UINT32)path.size(), &hp);
+        ComPtr<IAsyncOperation<StorageFile*>> op;
+        HRESULT hr = fileStatics->GetFileFromPathAsync(hp, op.GetAddressOf());
+        WindowsDeleteString(hp);
+        if (FAILED(hr)) return false;
+        if (FAILED(AwaitOp(op.Get(), file, 20000)) || !file) return false;
+    }
+
+    ComPtr<IRandomAccessStream> stream;
+    {
+        ComPtr<IAsyncOperation<IRandomAccessStream*>> op;
+        if (FAILED(file->OpenAsync(FileAccessMode_Read, op.GetAddressOf()))) return false;
+        if (FAILED(AwaitOp(op.Get(), stream, 20000)) || !stream) return false;
+    }
+
+    ComPtr<IBitmapDecoderStatics> decStatics;
+    if (FAILED(GetStatics(L"Windows.Graphics.Imaging.BitmapDecoder", __uuidof(IBitmapDecoderStatics),
+                          (void**)decStatics.GetAddressOf())))
+        return false;
+
+    ComPtr<IBitmapDecoder> decoder;
+    {
+        ComPtr<IAsyncOperation<BitmapDecoder*>> op;
+        if (FAILED(decStatics->CreateAsync(stream.Get(), op.GetAddressOf()))) return false;
+        if (FAILED(AwaitOp(op.Get(), decoder, 20000)) || !decoder) return false;
+    }
+
+    ComPtr<ISoftwareBitmap> bmp;
+    {
+        ComPtr<IBitmapFrame> frame;
+        ComPtr<IAsyncOperation<BitmapFrame*>> op;
+        if (FAILED(decoder->GetFrameAsync(0, op.GetAddressOf()))) return false;
+        if (FAILED(AwaitOp(op.Get(), frame, 20000)) || !frame) return false;
+        ComPtr<IBitmapFrameWithSoftwareBitmap> fwsb;
+        if (FAILED(frame.As(&fwsb)) || !fwsb) return false;
+        ComPtr<IAsyncOperation<SoftwareBitmap*>> opBmp;
+        if (FAILED(fwsb->GetSoftwareBitmapAsync(opBmp.GetAddressOf()))) return false;
+        if (FAILED(AwaitOp(opBmp.Get(), bmp, 20000)) || !bmp) return false;
+    }
+
+    ComPtr<IOcrResult> result;
+    {
+        ComPtr<IAsyncOperation<OcrResult*>> op;
+        if (FAILED(engine->RecognizeAsync(bmp.Get(), op.GetAddressOf()))) return false;
+        if (FAILED(AwaitOp(op.Get(), result, 60000)) || !result) return false;
+    }
+
+    HSTRING text = nullptr;
+    if (FAILED(result->get_Text(&text)) || !text) return false;
+    UINT32 len = 0;
+    const wchar_t* raw = WindowsGetStringRawBuffer(text, &len);
+    out.assign(raw, raw + len);
+    WindowsDeleteString(text);
+
+    // OCR 会把每个"词"用空格隔开，中文之间这些空格是多余的，去掉更好读
+    std::wstring tidy;
+    tidy.reserve(out.size());
+    auto isCjk = [](wchar_t c) {
+        return (c >= 0x3000 && c <= 0x303F) || (c >= 0x3040 && c <= 0x30FF) ||
+               (c >= 0x3400 && c <= 0x4DBF) || (c >= 0x4E00 && c <= 0x9FFF) ||
+               (c >= 0xAC00 && c <= 0xD7AF) || (c >= 0xF900 && c <= 0xFAFF) ||
+               (c >= 0xFF00 && c <= 0xFF65);
+    };
+    for (size_t i = 0; i < out.size(); ++i) {
+        if (out[i] == L' ' && !tidy.empty() && i + 1 < out.size() &&
+            isCjk(tidy.back()) && isCjk(out[i + 1]))
+            continue;
+        tidy += out[i];
+    }
+    out.swap(tidy);
+    return !out.empty();
+}
+
+} // namespace ocrwin
+
+struct OcrPdfJob {
+    std::wstring pdf;
+    std::wstring text;
+    std::wstring err;
+    int maxPages = 3;
+    int dpi = 150;
+    bool ok = false;
+};
+
+static int OcrPageNumOf(const std::wstring& path) {
+    size_t dot = path.find_last_of(L'.');
+    if (dot == std::wstring::npos) return 0;
+    size_t dash = path.find_last_of(L'-', dot);
+    if (dash == std::wstring::npos) return 0;
+    return _wtoi(path.substr(dash + 1, dot - dash - 1).c_str());
+}
+
+static unsigned __stdcall OcrPdfThreadProc(void* p) {
+    OcrPdfJob* job = (OcrPdfJob*)p;
+    HRESULT hrInit = RoInitialize(RO_INIT_MULTITHREADED);
+    const bool initedHere = SUCCEEDED(hrInit);
+    do {
+        std::wstring tool;
+        if (!FindToolExe(L"pdftoppm.exe", tool)) {
+            job->err = L"未找到 pdftoppm.exe（poppler 的 PDF 转图工具）";
+            break;
+        }
+        std::wstring tmp = MakeTempDir();
+        if (tmp.empty()) { job->err = L"创建临时目录失败"; break; }
+        std::wstring prefix = tmp + L"\\page";
+        // ★安全：PDF 路径可能很长（深层目录/长文件名），固定 256 会截断并留下未终止串，
+        //   命令拼坏后 OCR 直接失败。改用 _TRUNCATE 保证终止（超长时宁可报错也不越界）。
+        wchar_t opt[1024];
+        _snwprintf_s(opt, 1024, _TRUNCATE, L" -r %d -png -f 1 -l %d \"%s\" \"%s\"",
+                 job->dpi, job->maxPages, job->pdf.c_str(), prefix.c_str());
+        DWORD ec = 1;
+        bool ran = RunHiddenProcess(L"\"" + tool + L"\"" + opt, 60000, &ec);
+        if (!ran) { job->err = L"PDF 转图超时（文件太大或页数太多）"; CleanupTempTree(tmp); break; }
+
+        std::vector<std::wstring> pages;
+        WIN32_FIND_DATAW fd{};
+        HANDLE h = FindFirstFileW((tmp + L"\\page*.png").c_str(), &fd);
+        if (h != INVALID_HANDLE_VALUE) {
+            do { pages.push_back(tmp + L"\\" + fd.cFileName); } while (FindNextFileW(h, &fd));
+            FindClose(h);
+        }
+        std::sort(pages.begin(), pages.end(), [](const std::wstring& a, const std::wstring& b) {
+            return OcrPageNumOf(a) < OcrPageNumOf(b);
+        });
+
+        std::wstring all;
+        for (size_t i = 0; i < pages.size(); ++i) {
+            std::wstring t;
+            if (ocrwin::RecognizeFile(pages[i], t) && !t.empty()) {
+                if (!all.empty()) all += L"\n\n";
+                all += t;
+            }
+        }
+        CleanupTempTree(tmp);
+        if (all.empty()) { job->err = L"扫描件里没识别出文字（分辨率太低或图片太糊）"; break; }
+        job->text = all;
+        job->ok = true;
+    } while (false);
+    if (initedHere) RoUninitialize();
+    return 0;
+}
+
+// 同步封装：开线程跑 OCR 并等待（OCR 是纯计算，超时强杀不会留副作用）
+static bool ExtractScannedPdf(const std::wstring& pdf, int maxPages, int dpi,
+                              std::wstring& out, std::wstring& err) {
+    OcrPdfJob job;
+    job.pdf = pdf;
+    job.maxPages = maxPages;
+    job.dpi = dpi;
+    HANDLE h = (HANDLE)_beginthreadex(nullptr, 0, OcrPdfThreadProc, &job, 0, nullptr);
+    if (!h) { err = L"启动 OCR 线程失败"; return false; }
+    DWORD w = WaitForSingleObject(h, 120000);
+    if (w == WAIT_TIMEOUT) {
+        TerminateThread(h, 1);
+        CloseHandle(h);
+        err = L"OCR 超时：页数太多或机器较慢，可调小「OCR 最多页数」";
+        return false;
+    }
+    CloseHandle(h);
+    if (!job.ok) { err = job.err.empty() ? L"OCR 失败" : job.err; return false; }
+    out = job.text;
+    return true;
+}
+
+static bool ExtractPdfText(const std::wstring& path, std::wstring& out, std::wstring& err) {
+    std::wstring tool;
+    if (!FindToolExe(L"pdftotext.exe", tool)) {
+        err = L"未找到 pdftotext.exe：把 poppler 的 pdftotext.exe 放到程序目录即可解析 PDF";
+        return false;
+    }
+    std::wstring tmp = MakeTempDir();
+    if (tmp.empty()) { err = L"创建临时目录失败"; return false; }
+    std::wstring outTxt = tmp + L"\\out.txt";
+    std::wstring cmd = L"\"" + tool + L"\" -enc UTF-8 -layout \"" + path + L"\" \"" + outTxt + L"\"";
+    DWORD ec = 1;
+    bool ran = RunHiddenProcess(cmd, 30000, &ec);
+    std::string bytes;
+    bool ok = false;
+    if (ran && ec == 0 && ReadWholeFileBytes(outTxt, 16u * 1024u * 1024u, bytes) && !bytes.empty()) {
+        out = DecodeTextBytes(bytes);
+        ok = !out.empty();
+        if (!ok) err = L"PDF 里没有可提取的文字（可能是扫描件）";
+    } else if (!ran) {
+        err = L"pdftotext 执行超时，PDF 可能过大";
+    } else {
+        err = L"PDF 解析失败（加密或扫描件），可以试试直接复制文字粘贴";
+    }
+    CleanupTempTree(tmp);
+
+    // ★扫描件兜底：文字层几乎为空时（少于 20 个可见字符），转图走 OCR
+    int visible = 0;
+    for (wchar_t c : out) if (!iswspace(c)) ++visible;
+    if (ok && visible >= 20) return true;
+    if (GetIniInt(L"Attach", L"OcrEnable", 1, 0, 1) == 0) {
+        err = L"PDF 没有文字层（扫描件），且「扫描件 OCR」是关闭的";
+        return false;
+    }
+    std::wstring ocrText, ocrErr;
+    int pages = GetIniInt(L"Attach", L"OcrMaxPages", 3, 1, 20);
+    int dpi = GetIniInt(L"Attach", L"OcrDpi", 150, 72, 400);
+    if (ExtractScannedPdf(path, pages, dpi, ocrText, ocrErr)) {
+        out = L"（扫描件 OCR 结果，前 " + std::to_wstring(pages) + L" 页）\n" + ocrText;
+        return true;
+    }
+    // 一张都没识别出来：明确报错，别把几行空白当正文塞给模型
+    err = L"PDF 没有文字层，OCR 也失败：" + ocrErr;
+    return false;
+}
+
+// ---------------- 对外入口 ----------------
+
+static std::wstring LowerExt(const std::wstring& path) {
+    const wchar_t* dot = wcsrchr(path.c_str(), L'.');
+    if (!dot) return L"";
+    std::wstring e = dot;
+    for (wchar_t& c : e) c = (wchar_t)towlower(c);
+    return e;
+}
+
+static bool IsImagePath(const std::wstring& path) {
+    std::wstring e = LowerExt(path);
+    return e == L".png" || e == L".jpg" || e == L".jpeg" || e == L".bmp" ||
+        e == L".gif" || e == L".webp" || e == L".tif" || e == L".tiff";
+}
+
+static bool IsTextPath(const std::wstring& path) {
+    static const wchar_t* kExts[] = {
+        L".txt", L".md", L".log", L".json", L".csv", L".tsv", L".ini", L".yaml", L".yml",
+        L".xml", L".html", L".htm", L".css", L".js", L".ts", L".jsx", L".tsx", L".py",
+        L".cpp", L".c", L".h", L".hpp", L".cs", L".java", L".go", L".rs", L".sql",
+        L".bat", L".ps1", L".sh", L".lua", L".kt", L".php", L".rb", L".toml", L".conf"
+    };
+    std::wstring e = LowerExt(path);
+    for (const wchar_t* x : kExts) if (e == x) return true;
+    return false;
+}
+
+static std::wstring FileNameOf(const std::wstring& path) {
+    const wchar_t* base = wcsrchr(path.c_str(), L'\\');
+    if (!base) base = wcsrchr(path.c_str(), L'/');
+    return base ? std::wstring(base + 1) : path;
+}
+
+// 文本落进 JSON 前先清洗：控制字符会让严格的网关直接 400；
+// 同时把 CRLF 统一成 LF、Tab 换成 4 空格（JSON 里不能出现裸 Tab）。
+static void SanitizeAttachmentText(std::wstring& s) {
+    std::wstring out;
+    out.reserve(s.size() + 32);
+    for (wchar_t c : s) {
+        if (c == L'\r') continue;
+        if (c == L'\n') { out += L'\n'; continue; }
+        if (c == L'\t') { out += L"    "; continue; }
+        if (c < 0x20 || c == 0x7F) continue;
+        out += c;
+    }
+    while (out.find(L"\n\n\n") != std::wstring::npos)
+        out.replace(out.find(L"\n\n\n"), 3, L"\n\n");
+    s.swap(out);
+}
+
+// 把本地文件变成待发送附件（按扩展名分派），失败时 err 给玩家看的原因
+static bool AddAttachmentFromPath(const std::wstring& path, std::wstring& err) {
+    int maxFiles = GetIniInt(L"Attach", L"MaxFiles", 4, 1, ATTACH_MAX_FILES);
+    if ((int)g_pendingAttachments.size() >= maxFiles) {
+        err = L"单次最多 " + std::to_wstring(maxFiles) + L" 个附件";
+        return false;
+    }
+    if (!PathFileExistsW(path.c_str())) { err = L"文件不存在：" + path; return false; }
+
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fad)) {
+        err = L"读不到文件属性：" + FileNameOf(path);
+        return false;
+    }
+    if (fad.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+        err = L"暂不支持文件夹，请选择具体文件";
+        return false;
+    }
+    ULONGLONG fsize = ((ULONGLONG)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
+
+    Attachment a;
+    a.path = path;
+    a.name = FileNameOf(path);
+    a.bytes = (size_t)fsize;
+    std::wstring e = LowerExt(path);
+    int maxSide = GetIniInt(L"Attach", L"ImageMaxSide", 1280, 512, 2048);
+    int maxChars = GetIniInt(L"Attach", L"TextMaxChars", 12000, 1000, 40000);
+
+    if (IsImagePath(path)) {
+        if (fsize > ATTACH_IMG_MAX_BYTES) { err = L"图片超过 8MB，请先压缩"; return false; }
+        Bitmap* bmp = Bitmap::FromFile(path.c_str());
+        if (!bmp || bmp->GetLastStatus() != Ok) {
+            delete bmp;
+            err = L"图片无法解码：" + a.name + L"（WebP/TIFF 可能缺系统解码器，请先转成 PNG/JPG）";
+            return false;
+        }
+        bool ok = EncodeBitmapToJpegBase64(bmp, maxSide, a.b64);
+        delete bmp;
+        if (!ok) { err = L"图片编码失败：" + a.name; return false; }
+        a.kind = ATTACH_KIND_IMAGE;
+        a.mime = "image/jpeg";
+        a.ok = true;
+    } else if (IsTextPath(path)) {
+        if (fsize > ATTACH_TEXT_MAX_BYTES) { err = L"文本文件超过 2MB，请先拆分"; return false; }
+        std::string bytes;
+        if (!ReadWholeFileBytes(path, ATTACH_TEXT_MAX_BYTES, bytes)) { err = L"读取失败：" + a.name; return false; }
+        std::wstring text = DecodeTextBytes(bytes);
+        if (text.empty()) { err = L"文件是空的：" + a.name; return false; }
+        bool truncated = false;
+        if ((int)text.size() > maxChars) { text.resize((size_t)maxChars); truncated = true; }
+        if (truncated) text += L"\n…（文件较长，已截断到 " + std::to_wstring(maxChars) + L" 字）";
+        a.kind = ATTACH_KIND_TEXT;
+        a.text = text;
+        a.ok = true;
+    } else if (e == L".pdf") {
+        if (fsize > ATTACH_MAX_BYTES) { err = L"PDF 超过 20MB"; return false; }
+        std::wstring text, why;
+        if (!ExtractPdfText(path, text, why)) { err = why; return false; }
+        if ((int)text.size() > maxChars) text.resize((size_t)maxChars);
+        a.kind = ATTACH_KIND_TEXT;
+        a.text = text;
+        a.ok = true;
+    } else if (e == L".docx") {
+        if (fsize > ATTACH_MAX_BYTES) { err = L"文档超过 20MB"; return false; }
+        std::wstring text, why;
+        if (!ExtractDocxText(path, text, why)) { err = why; return false; }
+        if ((int)text.size() > maxChars) text.resize((size_t)maxChars);
+        a.kind = ATTACH_KIND_TEXT;
+        a.text = text;
+        a.ok = true;
+    } else if (e == L".xlsx") {
+        if (fsize > ATTACH_MAX_BYTES) { err = L"表格超过 20MB"; return false; }
+        std::wstring text, why;
+        if (!ExtractXlsxText(path, text, why)) { err = why; return false; }
+        if ((int)text.size() > maxChars) text.resize((size_t)maxChars);
+        a.kind = ATTACH_KIND_TEXT;
+        a.text = text;
+        a.ok = true;
+    } else {
+        err = L"不支持的类型：" + (e.empty() ? L"(无扩展名)" : e) +
+            L"（支持 图片 / txt·md·代码 / pdf / docx / xlsx）";
+        return false;
+    }
+
+    if (a.ok && a.kind != ATTACH_KIND_IMAGE && !a.text.empty())
+        SanitizeAttachmentText(a.text);
+
+    g_pendingAttachments.push_back(a);
+    PetDbgW((L"[ATTACH] 已加入：" + a.name + L"\n").c_str());
+    return true;
+}
+
+// 语音转写结果作为附件（音频本体不发送，模型只吃文字）
+static bool AddVoiceAttachment(const std::wstring& wavPath, const std::wstring& transcript,
+    size_t bytes, std::wstring& err) {
+    int maxFiles = GetIniInt(L"Attach", L"MaxFiles", 4, 1, ATTACH_MAX_FILES);
+    if ((int)g_pendingAttachments.size() >= maxFiles) {
+        err = L"单次最多 " + std::to_wstring(maxFiles) + L" 个附件";
+        return false;
+    }
+    std::wstring text = transcript;
+    if (text.empty()) { err = L"没听清，换个近一点的距离再说一次？"; return false; }
+    Attachment a;
+    a.kind = ATTACH_KIND_VOICE;
+    a.path = wavPath;
+    a.name = L"语音";
+    a.text = text;
+    a.bytes = bytes;
+    a.ok = true;
+    g_pendingAttachments.push_back(a);
+    return true;
+}
+
+// 历史里只写占位符，绝不写正文/base64
+static std::wstring BuildAttachmentHistoryTag(const std::vector<Attachment>& atts) {
+    std::wstring tag;
+    for (const Attachment& a : atts) {
+        if (!a.ok) continue;
+        if (a.kind == ATTACH_KIND_IMAGE)      tag += L"[图片 " + a.name + L"] ";
+        else if (a.kind == ATTACH_KIND_VOICE) tag += L"[语音] ";
+        else                                  tag += L"[文件 " + a.name + L"] ";
+    }
+    return tag;
+}
+
+// 拼 user 消息的 content：无图 → 字符串（老格式）；有图 → content 数组
+static std::wstring BuildUserContentJson(const std::wstring& userText,
+    const std::vector<Attachment>& atts) {
+    std::wstring textPart = userText;
+    std::wstring imageParts;
+    int imageCount = 0;
+    for (const Attachment& a : atts) {
+        if (!a.ok) continue;
+        if (a.kind == ATTACH_KIND_IMAGE && !a.b64.empty()) {
+            ++imageCount;
+            imageParts += L",{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/jpeg;base64,"
+                + Utf8ToWideString(a.b64) + L"\"}}";
+        } else if (!a.text.empty()) {
+            if (a.kind == ATTACH_KIND_VOICE) {
+                textPart += L"\n\n【语音消息转写】\n" + a.text;
+            } else {
+                textPart += L"\n\n<file name=\"" + a.name + L"\" chars=\"" +
+                    std::to_wstring(a.text.size()) + L"\">\n" + a.text + L"\n</file>";
+            }
+        }
+    }
+    if (imageCount == 0)
+        return L"\"" + EscapeJsonW(textPart) + L"\"";
+    // 提醒模型这轮真的有图，避免它把图片当装饰忽略掉
+    textPart = L"（随消息附上 " + std::to_wstring(imageCount) +
+        L" 张图片，请结合图片内容理解主人的话）\n" + textPart;
+    std::wstring out;
+    out.reserve(textPart.size() * 4 + imageParts.size() + 64);
+    out = L"[{\"type\":\"text\",\"text\":\"" + EscapeJsonW(textPart) + L"\"" + imageParts + L"}]";
+    return out;
+}
+
+// 纯文本版本的请求体（图片被网关拒绝时自动降级用）
+static std::wstring BuildUserContentTextOnly(const std::wstring& userText,
+    const std::vector<Attachment>& atts) {
+    std::wstring textPart = userText;
+    for (const Attachment& a : atts) {
+        if (!a.ok) continue;
+        if (a.kind == ATTACH_KIND_IMAGE) {
+            textPart += L"\n\n[图片 " + a.name + L"：当前模型不支持看图，无法读取内容]";
+        } else if (a.kind == ATTACH_KIND_VOICE) {
+            textPart += L"\n\n【语音消息转写】\n" + a.text;
+        } else if (!a.text.empty()) {
+            textPart += L"\n\n<file name=\"" + a.name + L"\">\n" + a.text + L"\n</file>";
+        }
+    }
+    return L"\"" + EscapeJsonW(textPart) + L"\"";
+}
+
+// proactive=true 表示这是定时主动搭话：用专门的开场白 prompt、不写历史、
+// 结果走气泡而不是聊天窗口打字机；hwnd 仍是主窗口，用于投递回主线程。
+struct LLMThreadParam {
+    HWND hwnd;
+    std::wstring input;
+    bool proactive = false;
+    // ★触摸互动：true 表示这次请求由"主人摸了某部位"触发。
+    //   touchPhrase 是预先生成的自然语言（如"主人摸了摸你的头"），
+    //   放在字符串里传进来，避免 LLM 线程（可能在 USE_LIVE2D=0 下编译）依赖部位枚举。
+    bool touch = false;
+    std::wstring touchPhrase;
+    // 会话序号：本次请求的 id。主线程只接受等于"当前期望序号"的回复。
+    int session = 0;
+    // ★附件：本轮随消息发送的图片/文件/语音转写（主线程填好，线程内只读）
+    std::vector<Attachment> attachments;
+    std::wstring historyTag;      // 历史占位符前缀，如 "[图片 a.jpg] "
+};
+
+// 聊天收尾消息：携带会话序号 + 本轮完整回复。
+//   LLM 线程发 WM_STREAM_DONE 时 new 出来，主线程用完 delete。
+//   历史落盘已挪到 LLM 线程（见 LLMThreadProc），UI 这里只负责显示与状态复位。
+struct StreamDoneMsg {
+    int session = 0;
+    std::wstring reply;
+};
 
 static unsigned __stdcall LLMThreadProc(void* param) {
     if (!param) return 0;                       // 防御空指针：静默返回，避免解引用崩溃
     LLMThreadParam* p = (LLMThreadParam*)param;
     HWND hwnd = p->hwnd;
     std::wstring userInput = p->input;
+    bool proactive = p->proactive;
+    bool touch = p->touch;
+    std::wstring touchPhrase = p->touchPhrase;
+    int session = p->session;                   // 本次请求的会话序号
+    // ★附件在 delete p 之前先搬出来（move 避免复制几百 KB 的 base64）
+    std::vector<Attachment> atts = std::move(p->attachments);
+    std::wstring attachTag = p->historyTag;
     delete p;
+
+    // ★触摸互斥标志用 RAII 清理：本函数有 7+ 处提前 return（网络失败等），
+    //   任何一条路径忘记手动复位都会让 g_touchRunning 永久为 true、再也摸不动。
+    struct TouchGuard {
+        volatile bool* flag;
+        explicit TouchGuard(volatile bool* f) : flag(f) {}
+        ~TouchGuard() { if (flag) *flag = false; }
+    } touchGuard(touch ? &g_touchRunning : nullptr);
+
+    // 统一错误上报，保证触摸触发的请求也能正确反馈。
+    //   错误路径统一发 WM_APPEND_TEXT/WM_STREAM_DONE 给 hwnd ——
+    //   聊天模式 hwnd 是聊天窗口（有这两个 case），没问题；但触摸/主动搭话模式
+    //   hwnd 是主窗口，主窗口根本没有这两个 case → 错误被 DefWindowProc 静默丢弃，
+    //   界面永远停在占位气泡"（……）"，看起来就像"连不上 LLM"。
+    //   这里按模式分流：触摸/搭话的错误发成对应气泡，聊天仍走原消息。
+    // hardError 标记"错误已就地展示给用户"，避免后续无谓重试 +
+    //   再叠一条通用"解析回复失败"提示（网络失败时两层提示会同时冒出来）。
+    bool hardError = false;
+    auto reportError = [&](const wchar_t* text) {
+        hardError = true;
+        if (touch || proactive) {
+            HWND mh = (g_hwnd && IsWindow(g_hwnd)) ? g_hwnd : hwnd;
+            UINT um = touch ? WM_APP_TOUCH_REPLY : WM_APP_PROACTIVE;
+            auto* b = new std::wstring(L"（" + std::wstring(text) + L"）");
+            if (!PostMessageW(mh, um, (WPARAM)PetEmotion::Base, (LPARAM)b)) delete b;
+        } else {
+            // 聊天模式错误要完整收尾，且顺序必须正确——
+            //   ① 先删掉"茉子：思考中..."占位（否则稍后的 WM_REMOVE_THINKING 会把
+            //      下面这条错误正文一起擦掉，用户只看到"（未收到回复）"）；
+            //   ② 再追加错误正文；③ 发带会话号的 StreamDoneMsg 复位按钮/状态。
+            //   发 lParam=0 的旧写法会被 if(done) 判空跳过，导致发送按钮永久禁用。
+            PostMessageW(hwnd, WM_REMOVE_THINKING, 0, 0);
+            auto* m = new std::wstring(text);
+            if (!PostMessageW(hwnd, WM_APPEND_TEXT, 0, (LPARAM)m)) delete m;
+            auto* done = new StreamDoneMsg();
+            done->session = session;
+            done->reply.clear();
+            if (!PostMessageW(hwnd, WM_STREAM_DONE, 0, (LPARAM)done)) delete done;
+        }
+    };
+
+    // 诊断：DebugView 搜 [TOUCH] 可看清每次触摸请求的关键节点
+    if (touch) PetDbgW(L"[TOUCH] 线程已启动，收到触摸事件描述\n");
 
     std::wstring apiUrl = GetLLMConfig(L"ApiUrl");
     std::wstring apiKey = GetLLMConfig(L"ApiKey");
     std::wstring model = GetLLMConfig(L"Model");
 
     if (apiUrl.empty() || apiKey.empty()) {
-        auto* msg = new std::wstring(L"请在 llm.ini 中配置 ApiUrl 和 ApiKey");
-        if (!PostMessageW(hwnd, WM_APPEND_TEXT, 0, (LPARAM)msg)) delete msg;
-        PostMessageW(hwnd, WM_STREAM_DONE, 0, 0);
+        reportError(L"请在 llm.ini 中配置 ApiUrl 和 ApiKey");
         return 0;
     }
 
@@ -3220,11 +7153,9 @@ static unsigned __stdcall LLMThreadProc(void* param) {
     urlComp.dwHostNameLength = (DWORD)-1;
     urlComp.dwUrlPathLength = (DWORD)-1;
     std::wstring urlBuf = apiUrl;                 // 放堆上，避免函数栈占用过大
-    if (urlBuf.empty()) { PostMessageW(hwnd, WM_STREAM_DONE, 0, 0); return 0; }
+    if (urlBuf.empty()) { reportError(L"ApiUrl 为空"); return 0; }
     if (!WinHttpCrackUrl(&urlBuf[0], (DWORD)urlBuf.size(), 0, &urlComp)) {
-        auto* msg = new std::wstring(L"ApiUrl 格式错误，请检查 llm.ini");
-        if (!PostMessageW(hwnd, WM_APPEND_TEXT, 0, (LPARAM)msg)) delete msg;
-        PostMessageW(hwnd, WM_STREAM_DONE, 0, 0);
+        reportError(L"ApiUrl 格式错误，请检查 llm.ini");
         return 0;
     }
 
@@ -3235,14 +7166,25 @@ static unsigned __stdcall LLMThreadProc(void* param) {
     if (urlComp.lpszUrlPath && urlComp.dwUrlPathLength > 0)
         wcsncpy_s(urlPath, urlComp.lpszUrlPath, min(urlComp.dwUrlPathLength, 255u));
 
-    std::wstring prompt = LoadPrompt();
+    // 用缓存的 prompt（启动时读一次），避免每轮全量读盘。
+    std::wstring prompt = GetCachedPrompt();
     std::wstring history = LoadChatHistory();
     size_t histMax = (size_t)GetLLMConfigInt(L"HistoryMaxChars", 4000, 500, 60000);
     if (history.size() > histMax) {
+        // 按轮次/段落边界截断：从字符切点向后（往字符串前面）找最近的段落起点
+        //   （"\r\n\r\n" 空行），保证不会从半句话/半轮对话中间切掉。
+        //   历史文件格式是 "主人：...\r\n\r\n茉子：...\r\n\r\n"，段间必有空行。
+        //   若找不到空行（旧格式/单段），退化为原 UTF-16 代理对齐逻辑。
         size_t cut = history.size() - histMax;
-        // wstring::substr 按 UTF-16 码元切，可能把代理对（emoji / 扩展汉字）
-        // 劈成孤立的低代理项，JSON 转义后就是非法 UTF-16。多退一个码元即可。
-        if (cut < history.size() && history[cut] >= 0xDC00 && history[cut] <= 0xDFFF) ++cut;
+        size_t para = history.rfind(L"\r\n\r\n", cut);
+        if (para != std::wstring::npos) {
+            // 对齐到空行之后（即下一段起点）。空行本身 4 字符，
+            // 段落起点 = para + 4；若该点仍是空行开头，再往后推。
+            cut = para + 4;
+        } else {
+            // 兜底：找不到段落边界，保持原 UTF-16 代理对对齐
+            if (cut < history.size() && history[cut] >= 0xDC00 && history[cut] <= 0xDFFF) ++cut;
+        }
         history = history.substr(cut);
     }
     // ★ 历史放进独立的 system 消息，而不是塞成一条 assistant 消息。
@@ -3256,7 +7198,7 @@ static unsigned __stdcall LLMThreadProc(void* param) {
             + EscapeJsonW(history) + L"\"}";
     }
 
-    // ★ 采样参数：从 llm.ini 读，没写就用默认值（原代码是硬编码的，改 ini 根本无效）
+    // 采样参数：从 llm.ini 读，没写就用默认值
     double temperature = GetLLMConfigDouble(L"Temperature", 0.9, 0.0, 2.0);
     double topP = GetLLMConfigDouble(L"TopP", 0.95, 0.0, 1.0);
     double presencePen = GetLLMConfigDouble(L"PresencePenalty", 0.6, -2.0, 2.0);
@@ -3266,10 +7208,17 @@ static unsigned __stdcall LLMThreadProc(void* param) {
 
     // ★ 这三个开关决定要不要把非通用字段发给网关。OpenAI 官方、DeepSeek、Kimi、智谱
     //   以及多数中转站都不认 chat_template_kwargs；部分网关也不支持 response_format。
-    //   原代码是硬编码全发，碰到不认的网关就返回 400、取不到 content。
+    //   硬编码全发会被不认该字段的网关返回 400、取不到 content。
     int    usePenalty = GetLLMConfigInt(L"UsePenalty", 1, 0, 1);
     int    useFmt = GetLLMConfigInt(L"UseResponseFormat", 1, 0, 1);
     int    useKw = GetLLMConfigInt(L"UseChatTemplateKwargs", 0, 0, 1);
+
+    // 开启 response_format 时，补一段"字段缺失也必须返回完整对象"的硬约束，
+    //   降低模型"漏字段/格式跑偏"的概率（配合下方的重试兜底）。
+    if (useFmt)
+        prompt = prompt + L"\n\n【输出完整性 - 关键】无论任何情况，你都必须返回一个完整的 JSON 对象，"
+            L"包含 zh 与 ja 两个字段（都不能为空字符串），可选字段缺失时省略即可，"
+            L"但绝不能省略 zh/ja、不能输出 JSON 以外的任何文字或代码块。";
 
     // ★ 长文本模式：放宽上限 + 追加一次性指令
     bool longForm = IsLongFormRequest(userInput);
@@ -3278,6 +7227,94 @@ static unsigned __stdcall LLMThreadProc(void* param) {
         if (longTok > maxTokens) maxTokens = longTok;
         prompt = prompt + L"\n\n" + LONG_INSTRUCT;
         PetDbgW(L"[LLM] 长文本模式：已放宽 max_tokens 并追加长篇指令\n");
+    }
+    // 导演指令：默认开启，仅追加"演出字段"说明，不改人设/世界观/口吻。
+    //   llm.ini [LLM] DirectorEnable=0 可完全关闭，行为与改造前一致。
+    bool directorOn = GetLLMConfigInt(L"DirectorEnable", 1, 0, 1) != 0;
+    if (directorOn && !proactive && !touch)
+        prompt = prompt + DIRECTOR_INSTRUCT;   // 主动搭话/触摸走各自简短 prompt，不堆演出字段
+
+    // ★触摸互动：把"主人摸了摸你的头"/"主人扯了扯你的裙子"这件事直接讲给模型，让它自己决定表情/台词/动作。
+    //   八部位（头/脸/手/胸/腹/裙/腿/脚）各有一句专属描述，经 touchPhrase 动态注入，与人设 prompt 无关。
+    //   触摸复用导演协议（emotion/action/gaze 由模型输出），因此在 touch 分支单独补一段
+    //   简短的演出提示；保留历史上下文，让她能结合你们的相处氛围自然反应。
+    if (touch) {
+        if (directorOn)
+            prompt = prompt + DIRECTOR_INSTRUCT;
+        userInput = std::wstring(L"【触摸互动】") + touchPhrase + L"。"
+            + L"请就在此时此地，自然地对这个触碰做出反应：先用一小句描写你的动作或神态（放在中文全角括号里，"
+            + L"例如「（脸微微一红，往旁边躲了躲）」），再接上你说的话。全程保持茉子本来的性格和口吻，"
+            + L"不要提到『触摸互动』『主人摸了你』这类旁白字眼，仿佛这真的正在发生。"
+            + L"只回复这一瞬间的反应，一到两句话即可，不要写成一整段长文。"
+            + L"仍然严格按 JSON 格式回复（zh/ja/emotion，可附带演出字段）。";
+        // 触摸回复默认给到 1200：思考型模型（如 agnes-2.5-flash 带 thinking）
+        // 会先在 reasoning 里吃掉不少 token，400 太小容易出现 content 为空 → "连不上"的假象。
+        int touchTok = GetLLMConfigInt(L"TouchMaxTokens", 1200, 256, 4000);
+        if (touchTok < maxTokens) maxTokens = touchTok;
+        PetDbgW(L"[LLM] 触摸互动模式：已注入触摸事件\n");
+    }
+
+    // 主动搭话：替换 user 输入，但不再完全清掉历史上下文。
+    //   注入"最近 1-2 轮对话摘要"（截断到 400 字以内）+ 已有的 memory 锚点，
+    //   prompt 里明确"可以顺势接上刚才的话题，但不许重复原话"。
+    //   这样既不会像全量历史那样把它带成复读，也不会像全清那样机械搭话。
+    if (proactive) {
+        // 结合时段、当前动作、陪伴时长拼一句自然的开场指令
+        std::wstring state;
+        if (g_bDragging)                    state = L"你正被主人拖来拖去";
+        else if (g_currentState == AnimState::Run)   state = L"你正在跑动";
+        else if (g_currentState == AnimState::Think) state = L"你正在发呆思考";
+        else                                state = L"你正安静地待在桌面上";
+        wchar_t hours[48];
+        int hm = (int)(g_stat.totalSeconds / 3600.0);
+        swprintf(hours, 48, L"已经陪了主人 %d 小时", hm);
+        userInput = std::wstring(L"【主动搭话】现在是") + TimeOfDayLabel() + L"，" + state + L"，"
+            + hours + L"。主人有一阵子没理你了。请主动开口说一句话，自然一点、贴合当下的时间和你正在做的事，"
+            + L"可以关心主人、撒个娇、分享一个念头或问个小问题；不要提到『主动搭话』或『系统』这类字眼，"
+            + L"就像你真的突然想说话一样。仍然严格按 JSON 格式回复（zh/ja/emotion）。";
+        // 主动搭话带最近 1-2 轮对话摘要（截断到 400 字以内），而不是全量历史
+        //   让茉子可以顺势接上刚才的话题，但 prompt 明确要求不重复原话。
+        int summaryMax = GetLLMConfigInt(L"ProactiveSummaryChars", 400, 0, 2000);
+        if (summaryMax > 0 && !history.empty()) {
+            // 目标是从"末尾往前 summaryMax 字"这段里取完整段落。
+            //   原写法 rfind(L"\r\n\r\n", keep) 的起始位置是 400（从头数），
+            //   历史一长就落在开头，跟"最近对话"完全无关，且仍会从半句切断。
+            const size_t tailStart = (history.size() > (size_t)summaryMax)
+                ? history.size() - (size_t)summaryMax : 0;
+            size_t pstart = tailStart;
+            // 找 tailStart 之前（含）最近的段落边界，从边界后开始取——
+            // 这样窗口第一句是完整的一段，不会从半句开头（同 M1 对齐思路）。
+            size_t pcut = history.rfind(L"\r\n\r\n", tailStart);
+            if (pcut != std::wstring::npos && pcut + 4 < history.size())
+                pstart = pcut + 4;
+            std::wstring summary = history.substr(pstart);
+            if (!summary.empty()) {
+                // 单段本身可能仍超长：从这段自己的末尾再截一次 summaryMax。
+                if (summary.size() > (size_t)summaryMax)
+                    summary = summary.substr(summary.size() - (size_t)summaryMax);
+                contextStr += L",{\"role\":\"system\",\"content\":\""
+                    + EscapeJsonW(L"【以下是你最近 1-2 轮和主人的对话片段，仅供了解你们刚才聊了什么，"
+                        L"你可以顺势接上话题、回应她的关心，但严禁照抄原文里的句子，"
+                        L"也不要提到『刚才』『上次』这类字眼——就像你真的突然想起什么一样】\n")
+                    + EscapeJsonW(summary) + L"\"}";
+            }
+        }
+        int shortTok = GetLLMConfigInt(L"ProactiveMaxTokens", 300, 128, 2000);
+        if (shortTok < maxTokens) maxTokens = shortTok;
+        PetDbgW(L"[LLM] 主动搭话模式：已注入最近对话摘要 + memory 锚点\n");
+    }
+
+    // 长期记忆注入：放在 proactive 清历史之后，避免被 clear 掉。
+    //   作为独立 system 消息，和对话历史并列，不改 prompt 主体/人设/口吻。
+    //   config 开关 MemoryEnable 控制（默认开）；主动搭话也带上，方便她"想起"你。
+    if (GetLLMConfigInt(L"MemoryEnable", 1, 0, 1)) {
+        std::wstring mem = BuildMemoryContext();
+        if (!mem.empty()) {
+            contextStr += L",{\"role\":\"system\",\"content\":\""
+                + EscapeJsonW(L"【以下是你长久记住的关于主人的事，请自然地记在心里、在合适时提起，"
+                    L"但不要生硬地一条条复述，更不要提到『记忆』『系统』这些字眼】\n")
+                + EscapeJsonW(mem) + L"\"}";
+        }
     }
     g_lastJsonTruncated = false;
 
@@ -3290,123 +7327,230 @@ static unsigned __stdcall LLMThreadProc(void* param) {
         return r;
         };
 
-    std::wstring jsonBodyW = L"{\"model\":\"" + model +
-        L"\",\"messages\":[{\"role\":\"system\",\"content\":\"" + EscapeJsonW(prompt) +
-        L"\"}" + contextStr + L",{\"role\":\"user\",\"content\":\"" + EscapeJsonW(userInput) +
-        L"\"}],\"stream\":false,\"max_tokens\":" + std::to_wstring(maxTokens) +
-        L",\"temperature\":" + numToW(temperature) +
-        L",\"top_p\":" + numToW(topP);
-    // ★ 非通用字段按开关拼接：关掉就一个字都不发，网关不会再因为不认识而报 400
-    if (usePenalty) {
-        jsonBodyW += L",\"presence_penalty\":" + numToW(presencePen) +
-            L",\"frequency_penalty\":" + numToW(freqPen);
-    }
-    if (useFmt) {
-        jsonBodyW += L",\"response_format\":{\"type\":\"json_object\"}";
-    }
-    if (useKw) {
-        jsonBodyW += L",\"chat_template_kwargs\":{\"enable_thinking\":";
-        jsonBodyW += (enableThink ? L"true" : L"false");
-        jsonBodyW += L"}";
-    }
-    jsonBodyW += L"}";
+    // ★附件：本轮 user content 可能是字符串（无图）或数组（有图），统一由
+    //   BuildUserContentJson 拼；有图且网关不认时再准备一份纯文本兜底体。
+    bool hasImage = false;
+    for (const Attachment& a : atts)
+        if (a.ok && a.kind == ATTACH_KIND_IMAGE && !a.b64.empty()) { hasImage = true; break; }
+    // 某些网关 response_format 与图片不能共存，可 [Attach] VisionForceJson=0 关掉
+    bool visionKeepFmt = GetIniInt(L"Attach", L"VisionForceJson", 1, 0, 1) != 0;
+    bool fmtThis = useFmt && (!hasImage || visionKeepFmt);
 
+    const std::wstring userJson = BuildUserContentJson(userInput, atts);
+    auto buildBody = [&](const std::wstring& ujson) -> std::wstring {
+        std::wstring b = L"{\"model\":\"" + model +
+            L"\",\"messages\":[{\"role\":\"system\",\"content\":\"" + EscapeJsonW(prompt) +
+            L"\"}" + contextStr + L",{\"role\":\"user\",\"content\":" + ujson +
+            L"}],\"stream\":false,\"max_tokens\":" + std::to_wstring(maxTokens) +
+            L",\"temperature\":" + numToW(temperature) +
+            L",\"top_p\":" + numToW(topP);
+        // ★ 非通用字段按开关拼接：关掉就一个字都不发，网关不会再因为不认识而报 400
+        if (usePenalty) {
+            b += L",\"presence_penalty\":" + numToW(presencePen) +
+                L",\"frequency_penalty\":" + numToW(freqPen);
+        }
+        if (fmtThis) b += L",\"response_format\":{\"type\":\"json_object\"}";
+        if (useKw) {
+            b += L",\"chat_template_kwargs\":{\"enable_thinking\":";
+            b += (enableThink ? L"true" : L"false");
+            b += L"}";
+        }
+        b += L"}";
+        return b;
+    };
+    std::wstring jsonBodyW = buildBody(userJson);
+    std::wstring jsonBodyTextOnly;
+    if (hasImage) jsonBodyTextOnly = buildBody(BuildUserContentTextOnly(userInput, atts));
 
-    std::string jsonBodyUtf8 = WideStringToUtf8(jsonBodyW);
-
-    HINTERNET hSession = WinHttpOpen(L"MakotoPet/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, NULL, NULL, 0);
-    if (!hSession) {
-        auto* msg = new std::wstring(L"网络初始化失败（WinHttpOpen）");
-        if (!PostMessageW(hwnd, WM_APPEND_TEXT, 0, (LPARAM)msg)) delete msg;
-        PostMessageW(hwnd, WM_STREAM_DONE, 0, 0);
-        return 0;
-    }
-    HINTERNET hConnect = WinHttpConnect(hSession, hostName, urlComp.nPort, 0);
-    if (!hConnect) {
-        WinHttpCloseHandle(hSession);
-        auto* msg = new std::wstring(L"无法连接服务器，请检查 ApiUrl");
-        if (!PostMessageW(hwnd, WM_APPEND_TEXT, 0, (LPARAM)msg)) delete msg;
-        PostMessageW(hwnd, WM_STREAM_DONE, 0, 0);
-        return 0;
-    }
-    HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"POST", urlPath, NULL, NULL, NULL,
-        urlComp.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0);
-    if (!hRequest) {
-        WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession);
-        auto* msg = new std::wstring(L"创建请求失败（WinHttpOpenRequest）");
-        if (!PostMessageW(hwnd, WM_APPEND_TEXT, 0, (LPARAM)msg)) delete msg;
-        PostMessageW(hwnd, WM_STREAM_DONE, 0, 0);
-        return 0;
-    }
-
-    std::wstring authHeader = L"Authorization: Bearer " + apiKey;
-    WinHttpAddRequestHeaders(hRequest, L"Content-Type: application/json; charset=utf-8", -1, WINHTTP_ADDREQ_FLAG_ADD);
-    WinHttpAddRequestHeaders(hRequest, authHeader.c_str(), -1, WINHTTP_ADDREQ_FLAG_ADD);
-
-    if (!WinHttpSendRequest(hRequest, NULL, 0, (LPVOID)jsonBodyUtf8.c_str(), (DWORD)jsonBodyUtf8.length(), (DWORD)jsonBodyUtf8.length(), 0)) {
-        WinHttpCloseHandle(hRequest);
-        WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession);
-        auto* msg = new std::wstring(L"发送请求失败（WinHttpSendRequest）");
-        if (!PostMessageW(hwnd, WM_APPEND_TEXT, 0, (LPARAM)msg)) delete msg;
-        PostMessageW(hwnd, WM_STREAM_DONE, 0, 0);
-        return 0;
-    }
-    // 不检查返回值的话，代理认证失败(407)、TLS 被拦截时会静默失败，
-    // 后面读到一个空响应，界面只会显示"解析回复失败"，完全看不出原因。
-    if (!WinHttpReceiveResponse(hRequest, NULL)) {
-        WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
-        auto* msg = new std::wstring(L"接收响应失败（WinHttpReceiveResponse）：多为代理认证失败或网络被拦截");
-        if (!PostMessageW(hwnd, WM_APPEND_TEXT, 0, (LPARAM)msg)) delete msg;
-        PostMessageW(hwnd, WM_STREAM_DONE, 0, 0);
-        return 0;
-    }
-    int httpStatus = 0;
-    {
+    // 重试封装：把"发一次请求"做成可重复的块。
+    //   解析失败（取不到 zh）时自动重试一次，重试体里追加更强的格式指令。
+    int httpStatus = 0;                 // 最近一次 HTTP 状态（供下方兜底提示）
+    auto doOneRequest = [&](const std::wstring& body, int attempt)
+        -> std::pair<std::string, std::string> {        // { fullResponse, serverErr }
+        std::string bodyA = WideStringToUtf8(body);
+        HINTERNET hSession = WinHttpOpen(L"MakotoPet/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, NULL, NULL, 0);
+        if (!hSession) { if (attempt == 0) reportError(L"网络初始化失败（WinHttpOpen）"); return { std::string(), std::string() }; }
+        HINTERNET hConnect = WinHttpConnect(hSession, hostName, urlComp.nPort, 0);
+        if (!hConnect) {
+            WinHttpCloseHandle(hSession);
+            if (attempt == 0) reportError(L"无法连接服务器，请检查 ApiUrl");
+            return { std::string(), std::string() };
+        }
+        HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"POST", urlPath, NULL, NULL, NULL,
+            urlComp.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0);
+        if (!hRequest) {
+            WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
+            if (attempt == 0) reportError(L"创建请求失败（WinHttpOpenRequest）");
+            return { std::string(), std::string() };
+        }
+        std::wstring authHeader = L"Authorization: Bearer " + apiKey;
+        WinHttpAddRequestHeaders(hRequest, L"Content-Type: application/json; charset=utf-8", (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD);
+        WinHttpAddRequestHeaders(hRequest, authHeader.c_str(), (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD);
+        {
+            char dbg[320];
+            _snprintf_s(dbg, sizeof dbg, _TRUNCATE,
+                "[LLM] send#%d: touch=%d proactive=%d model=[%s] max_tokens=%d bodyLen=%u\n",
+                attempt, touch ? 1 : 0, proactive ? 1 : 0,
+                WideStringToUtf8(model).c_str(), maxTokens, (unsigned)bodyA.length());
+            PetDbgA(dbg);
+        }
+        if (!WinHttpSendRequest(hRequest, NULL, 0, (LPVOID)bodyA.c_str(), (DWORD)bodyA.length(), (DWORD)bodyA.length(), 0)) {
+            WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
+            if (attempt == 0) reportError(L"发送请求失败（WinHttpSendRequest）");
+            return { std::string(), std::string() };
+        }
+        if (!WinHttpReceiveResponse(hRequest, NULL)) {
+            WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
+            if (attempt == 0) reportError(L"接收响应失败（WinHttpReceiveResponse）：多为代理认证失败或网络被拦截");
+            return { std::string(), std::string() };
+        }
         DWORD code = 0, cs = sizeof(code);
         if (WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
             WINHTTP_HEADER_NAME_BY_INDEX, &code, &cs, WINHTTP_NO_HEADER_INDEX))
-            httpStatus = (int)code;
+            httpStatus = (int)code;      // [&] 捕获，写回外层 httpStatus
+        // 响应体设 32MB 上限并按 4MB 分块读取，避免异常网关的超大响应吃满内存。
+        const size_t kMaxResponse = 32u * 1024u * 1024u;
+        std::string fullResponse;
+        DWORD dwSize = 0, dwDownloaded = 0;
+        for (;;) {
+            dwSize = 0;
+            if (!WinHttpQueryDataAvailable(hRequest, &dwSize) || dwSize == 0) break;
+            if (fullResponse.size() >= kMaxResponse) {
+                PetDbgW(L"[LLM] 响应超过 32MB，已停止读取（避免内存耗尽）\n");
+                break;
+            }
+            if (dwSize > 4u * 1024u * 1024u) dwSize = 4u * 1024u * 1024u;
+            std::vector<char> buffer(dwSize);
+            if (!WinHttpReadData(hRequest, buffer.data(), dwSize, &dwDownloaded) || dwDownloaded == 0) break;
+            fullResponse.append(buffer.data(), dwDownloaded);
+        }
+        WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
+        {
+            char dbg[192];
+            _snprintf_s(dbg, sizeof dbg, _TRUNCATE,
+                "[LLM] recv#%d: HTTP=%d respLen=%u\n",
+                attempt, httpStatus, (unsigned)fullResponse.size());
+            PetDbgA(dbg);
+        }
+        std::string serverErr;
+        if (fullResponse.find("\"error\"") != std::string::npos) {
+            PetDbgA("[LLM] error response begin\n");
+            PetDbgA(fullResponse.c_str());
+            PetDbgA("\n[LLM] error response end\n");
+            serverErr = ExtractJsonString(fullResponse, "message");
+            if (serverErr.empty()) serverErr = ExtractJsonString(fullResponse, "msg");
+            if (serverErr.empty()) serverErr = ExtractJsonString(fullResponse, "error");
+            if (serverErr.empty()) serverErr = "服务端返回了 error 字段（完整响应见 VS 输出窗口）";
+        }
+        return { fullResponse, serverErr };
+    };
+
+    std::string serverErr;
+    std::string assistantRaw;
+    std::string jsonObj;
+    std::string zhUtf8, jaUtf8;
+
+    // 主请求 + 解析失败自动重试一次（重试体里追加更强格式指令）
+    //   重试时把"必须输出完整 JSON"约束追加到 messages 数组末尾（system 消息），
+    //   而不是塞到外层对象里，避免破坏 JSON 结构。
+    for (int attempt = 0; attempt <= 1; ++attempt) {
+        std::wstring body = jsonBodyW;
+        if (attempt == 1) {
+            std::wstring stronger =
+                L",{\"role\":\"system\",\"content\":\""
+                + EscapeJsonW(L"【重试】你上一次的输出无法被程序解析成 JSON。"
+                    L"请严格只输出一个 JSON 对象，必须同时包含非空的 zh 与 ja 两个字段，"
+                    L"不要任何解释、Markdown、代码块。")
+                + L"\"}";
+            // 在 messages 数组的闭合 "]" 前插入（找到 "]," 即 messages 数组结束处）
+            //   jsonBodyW 形如 {...,"messages":[...],"stream":false,...}
+            size_t mEnd = body.find(L"],\"stream\":");
+            if (mEnd == std::wstring::npos) mEnd = body.find(L"],");
+            if (mEnd != std::wstring::npos)
+                body.insert(mEnd, stronger);   // 插到 "]" 之前
+        }
+        auto pr = doOneRequest(body, attempt);
+        // ★附件降级：网关不认 content 数组 / data URI 时（400/415/422），
+        //   立刻换纯文本体重发一次，图片降级成"[图片 xxx]"说明，不至于整轮失败。
+        if (hasImage && !jsonBodyTextOnly.empty() &&
+            (httpStatus == 400 || httpStatus == 415 || httpStatus == 422)) {
+            PetDbgW(L"[ATTACH] 多模态请求被拒，自动降级为纯文本重发\n");
+            pr = doOneRequest(jsonBodyTextOnly, attempt);
+        }
+        std::string fullResponse = pr.first;
+        serverErr = pr.second;
+        assistantRaw = ExtractAssistantContent(fullResponse);
+        PetDbgA("[LLM] raw content begin\n");
+        PetDbgA(assistantRaw.c_str());
+        PetDbgA("\n[LLM] raw content end\n");
+        jsonObj = CleanToJsonObject(assistantRaw);
+        // 字段归一化：按别名表统一映射（大小写/中英/别名一次取全）
+        zhUtf8 = ExtractJsonStringAny(jsonObj, AliasZh());
+        jaUtf8 = ExtractJsonStringAny(jsonObj, AliasJa());
+        // ★ 模型压根没输出 JSON（直接回了一段话），把这段话当正文用
+        if (zhUtf8.empty() && !assistantRaw.empty() && assistantRaw.find('{') == std::string::npos)
+            zhUtf8 = assistantRaw;
+        // 成功取到正文 -> 跳出重试
+        if (!zhUtf8.empty()) break;
+        // 只有"确实收到了 HTTP 响应、但解析不出 zh"才值得重试。
+        //   网络失败（hardError 已就地报错）或服务端明确报错（serverErr 非空）
+        //   时重试只会把同一条提示再叠一遍，直接跳出。
+        if (hardError || !serverErr.empty() || fullResponse.empty()) break;
+        if (attempt == 0) {
+            PetDbgW(L"[M7] HTTP 响应解析不出 zh，追加强格式指令重试一次\n");
+            Sleep(300);
+        }
     }
 
-    std::string fullResponse;
-    DWORD dwSize = 0, dwDownloaded = 0;
-    for (;;) {
-        dwSize = 0;
-        if (!WinHttpQueryDataAvailable(hRequest, &dwSize) || dwSize == 0) break;
-        std::vector<char> buffer(dwSize);
-        if (!WinHttpReadData(hRequest, buffer.data(), dwSize, &dwDownloaded) || dwDownloaded == 0) break;
-        fullResponse.append(buffer.data(), dwDownloaded);
+    // 网络/解析错误已由 reportError 就地展示（含按钮复位），
+    //   不再走下方通用"解析失败"/"接口报错"兜底，避免提示叠加。
+    if (hardError) {
+        if (proactive) g_proactiveRunning = false;  // 及时释放互斥，避免 90s 超时延迟
+        return 0;
     }
-    WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
-
-    std::string serverErr;   // 服务端返回的具体报错原因
-    if (fullResponse.find("\"error\"") != std::string::npos) {
-        // ★ 完整响应里包含对话正文，默认不输出，排查时才开 PET_ENABLE_DEBUG_LOG
-        PetDbgA("[LLM] error response begin\n");
-        PetDbgA(fullResponse.c_str());
-        PetDbgA("\n[LLM] error response end\n");
-        // ★ 把服务端说的具体原因取出来，直接显示在聊天窗口里，
-        //   不用再开日志去猜是 401、404 还是不认识某个字段
-        serverErr = ExtractJsonString(fullResponse, "message");
-        if (serverErr.empty()) serverErr = ExtractJsonString(fullResponse, "msg");
-        if (serverErr.empty()) serverErr = ExtractJsonString(fullResponse, "error");
-        if (serverErr.empty()) serverErr = "服务端返回了 error 字段（完整响应见 VS 输出窗口）";
-    }
-
-    std::string assistantRaw = ExtractAssistantContent(fullResponse);
-    PetDbgA("[LLM] raw content begin\n");
-    PetDbgA(assistantRaw.c_str());
-    PetDbgA("\n[LLM] raw content end\n");
-
-    std::string jsonObj = CleanToJsonObject(assistantRaw);
-    std::string zhUtf8 = ExtractJsonString(jsonObj, "zh");
-    std::string jaUtf8 = ExtractJsonString(jsonObj, "ja");
 
     // ★ 好感度由模型这一轮给出的增减值决定（缺字段时退回 +1，保证仍有推进）。
     //   结算放在打字机跑完、历史已存档之后，界面上的顺序才不会串。
-    int affDelta = ExtractJsonInt(jsonObj, "affection", 1, -3, 5);
+    //   按别名表归一化提取（affection/好感/好感度）。
+    //   数字字段走 ExtractJsonIntAny（兼容 2/"2"/2.0/负数），
+    //   数字字段兼容 2/"2"/2.0/负数，范围 [-3,5]，缺省 1。
+    int affDelta = ExtractJsonIntAny(jsonObj, AliasAffection(), 1, -3, 5, nullptr);
+
+    // 情绪解析：模型多返回的 emotion 字段，驱动动作/语气/心情三层反馈。
+    //   按别名表归一化（emotion/情绪/心情/mood）。
+    PetEmotion emo = ParseEmotion(ExtractJsonStringAny(jsonObj, AliasEmotion()));
+    {
+        char ebuf[96];
+        _snprintf_s(ebuf, sizeof ebuf, _TRUNCATE, "[EMO] emotion=%d  proactive=%d\n",
+            (int)emo, proactive ? 1 : 0);
+        PetDbgA(ebuf);
+    }
+
+    // ★ 主动搭话不刷累计好感：定时说话若给分，挂着就能涨满，会毁掉养成节奏。
+    //   但仍保留情绪的心情波动（通过下面的 WM_APP_EMOTION），让互动有温度。
+    //   触摸互动同理：好感在 DoBodyTouch 点击瞬间已本地结算，这里归零避免双重加分。
+    if (proactive || touch) affDelta = 0;
+
+    // 情绪 -> 心情微调：只叠加 mood（影响爱心显示），不动 affinityTotal。
+    // 由主窗口在收到 WM_APP_EMOTION 后按开关决定是否应用，避免后台线程碰共享状态。
+    int emoMood = GetLLMConfigInt(L"EmotionAffinity", 1, 0, 1) ? EmotionMoodDelta(emo) : 0;
+
+    // 导演字段解析：全部可选，缺省时不覆盖任何旧行为。
+    int  dirAction  = -1;
+    int  dirGaze    = -1;
+    float dirIntensity = 0.0f;
+    std::wstring dirMemory;
+    if (directorOn) {
+        dirIntensity = ExtractJsonFloat(jsonObj, "intensity", 0.0f, 0.0f, 1.0f);
+        dirAction = ParseDirectorAction(ExtractJsonString(jsonObj, "action"));
+        dirGaze   = ParseDirectorGaze(ExtractJsonString(jsonObj, "gaze"));
+        std::string memUtf8 = ExtractJsonStringAny(jsonObj, AliasMemory());
+        if (!memUtf8.empty()) dirMemory = Utf8ToWideString(memUtf8);
+    }
+    // 记忆落盘：只有非主动搭话、且开关开启时才记，避免定时搭话把记忆刷满。
+    if (!proactive && !dirMemory.empty() && GetLLMConfigInt(L"MemoryEnable", 1, 0, 1))
+        AppendMemoryLine(dirMemory);
+
     {
         std::lock_guard<std::recursive_mutex> lk(g_statMtx);
         // ★ 排查用：VS 输出窗口搜 [AFF] 就能看到模型这一轮到底给了几分
@@ -3419,19 +7563,8 @@ static unsigned __stdcall LLMThreadProc(void* param) {
         PetDbgA(dbg);
     }
 
-    // ★ 模型可能把字段名写成中文或别的叫法，按顺序试一遍，别让整轮对话白跑
-    if (zhUtf8.empty()) {
-        static const char* altZh[] = { "中文", "cn", "chinese", "reply", "content", "text" };
-        for (const char* k : altZh) { zhUtf8 = ExtractJsonString(jsonObj, k); if (!zhUtf8.empty()) break; }
-    }
-    if (jaUtf8.empty()) {
-        static const char* altJa[] = { "日文", "日语", "jp", "japanese" };
-        for (const char* k : altJa) { jaUtf8 = ExtractJsonString(jsonObj, k); if (!jaUtf8.empty()) break; }
-    }
-    // ★ 模型压根没输出 JSON（比如直接回了一段话），那就把这段话当正文用
-    if (zhUtf8.empty() && !assistantRaw.empty() && assistantRaw.find('{') == std::string::npos)
-        zhUtf8 = assistantRaw;
-
+    // 兜底（zh/ja 已在上方按别名表归一化提取，非 JSON 原文兜底也已在重试循环里处理）。
+    //   这里只剩"服务端 error 字段"和"彻底解析失败"两种提示。
     if (zhUtf8.empty() && !serverErr.empty()) {
         zhUtf8 = "（接口报错：" + serverErr + "）";
     }
@@ -3453,103 +7586,1236 @@ static unsigned __stdcall LLMThreadProc(void* param) {
 
     PostMessageW(hwnd, WM_REMOVE_THINKING, 0, 0);
 
-    // ★ 打字机自适应：长回复自动加速并批量送出，1500 字不再要等 45 秒
-    TypewriterPlan tp = PlanTypewriter(zhReply.size());
-    for (size_t i = 0; i < zhReply.size();) {
-        if (!IsWindow(hwnd)) break;
-        size_t n = (size_t)tp.charsPerTick;
-        if (i + n > zhReply.size()) n = zhReply.size() - i;
-        auto* ch = new std::wstring(zhReply.substr(i, n));
-        if (!PostMessageW(hwnd, WM_APPEND_CHAR, 0, (LPARAM)ch)) delete ch;
-        i += n;
-        Sleep((DWORD)tp.delayMs);
+    // 历史落盘挪到 LLM 线程完成（UI 只负责显示，窗口关闭也不丢历史）。
+    //   聊天/触摸两条线程都写，SaveChatHistory 内部已加 g_historyFileMtx 串行化。
+    if (!proactive && !touch && !userInput.empty()) {
+        // ★附件只写占位符（如 "[图片 a.jpg] 帮我看看"），正文/base64 绝不落盘
+        SaveChatHistory(attachTag + userInput, zhReply);
+    } else if (touch) {
+        // 触摸：旁白 + 回复成对写盘（主线程 WM_APP_TOUCH_REPLY 也有一份旧逻辑，
+        //   为避免双写，触摸改为只在主线程写一次——见下方，线程内不写）
+    } else if (proactive) {
+        // 主动搭话也 quietly 写一条历史（带"（主动搭话）"标注），方便回看。
+        //   默认开，可在 llm.ini 设 ProactiveSaveHistory=0 关闭。
+        if (GetLLMConfigInt(L"ProactiveSaveHistory", 1, 0, 1) && !zhReply.empty())
+            SaveChatHistory(L"", L"（主动搭话）茉子：" + zhReply);
     }
 
-    auto* replyMsg = new std::wstring(zhReply);
-    if (!PostMessageW(hwnd, WM_STREAM_DONE, 0, (LPARAM)replyMsg)) delete replyMsg;
+    if (touch) {
+        // 触摸回复呈现统一：走"回复呈现层"——聊天窗打开就进窗口，
+        //   未打开时按 TouchReplyMode 决定弹贴角色轻气泡或自动开窗口。
+        HWND mainHwnd = (g_hwnd && IsWindow(g_hwnd)) ? g_hwnd : hwnd;
+        auto* bubble = new std::wstring(zhReply);
+        if (!PostMessageW(mainHwnd, WM_APP_TOUCH_REPLY, (WPARAM)emo, (LPARAM)bubble)) delete bubble;
+    } else if (proactive) {
+        // 主动搭话：不走聊天窗口打字机，直接把这句话发到主窗口弹气泡。
+        //   用 WM_APP_PROACTIVE，lParam = new std::wstring(要显示的话)，主线程负责释放。
+        HWND mainHwnd = (g_hwnd && IsWindow(g_hwnd)) ? g_hwnd : hwnd;
+        auto* bubble = new std::wstring(zhReply);
+        if (!PostMessageW(mainHwnd, WM_APP_PROACTIVE, (WPARAM)emo, (LPARAM)bubble)) delete bubble;
+    } else {
+        // ★ 打字机自适应：长回复自动加速并批量送出，1500 字不再要等 45 秒
+        TypewriterPlan tp = PlanTypewriter(zhReply.size());
+        g_typewriterSkip.store(false);        // 新一轮开始，清跳过信号
+        for (size_t i = 0; i < zhReply.size();) {
+            if (!IsWindow(hwnd)) break;
+            // 跳过信号：UI 收到点击/任意键后 set，这里立刻把剩余全文一次灌入
+            if (g_typewriterSkip.load()) {
+                auto* rest = new std::wstring(zhReply.substr(i));
+                if (!PostMessageW(hwnd, WM_APPEND_TEXT, 0, (LPARAM)rest)) delete rest;
+                i = zhReply.size();
+                break;
+            }
+            size_t n = (size_t)tp.charsPerTick;
+            if (i + n > zhReply.size()) n = zhReply.size() - i;
+            auto* ch = new std::wstring(zhReply.substr(i, n));
+            if (!PostMessageW(hwnd, WM_APPEND_CHAR, 0, (LPARAM)ch)) delete ch;
+            i += n;
+            Sleep((DWORD)tp.delayMs);
+        }
+        g_typewriting = false;
+        // 携带会话序号：UI 只接受等于当前序号的收尾消息，晚到的旧轮回复被丢弃
+        auto* done = new StreamDoneMsg();
+        done->session = session; done->reply = zhReply;
+        if (!PostMessageW(hwnd, WM_STREAM_DONE, 0, (LPARAM)done)) delete done;
+    }
+
     // ★ WM_APP_AFFINITY 的处理函数在【主窗口 WndProc】里，聊天窗口 ChatWndProc 没有这个 case。
     //   必须发给主窗口：聊天窗口不处理这条消息，会被 DefWindowProc 丢弃，
     //   结果是好感度永远不累加、解锁提示也不会弹出。
+    //   ★ 主动搭话 affDelta 已归零，这里仍发（0）以触发一次存档/面板刷新也无妨，
+    //     但没必要，直接跳过。
     HWND affHwnd = (g_hwnd && IsWindow(g_hwnd)) ? g_hwnd : hwnd;
-    PostMessageW(affHwnd, WM_APP_AFFINITY, (WPARAM)(affDelta + AFFINITY_MSG_BIAS), 0);
+    if (!proactive)
+        PostMessageW(affHwnd, WM_APP_AFFINITY, (WPARAM)(affDelta + AFFINITY_MSG_BIAS), 0);
+
+    // 导演反馈：发到主窗口，一次性驱动 动作/表情/视线/音效/心情。
+    //   lParam = new L2dDirectorCmd，主线程用完 delete（PostMessage 失败要自己回收）。
+    {
+        HWND emoHwnd = (g_hwnd && IsWindow(g_hwnd)) ? g_hwnd : hwnd;
+        auto* cmd = new L2dDirectorCmd();
+        cmd->emotion    = emo;
+        cmd->moodDelta  = emoMood;
+        cmd->intensity  = dirIntensity;
+        cmd->action     = directorOn ? dirAction : -1;
+        cmd->gaze       = directorOn ? dirGaze   : -1;
+        // 强度越高，视线演出保持越久（纯演出参数，不影响任何语言/口吻）
+        cmd->gazeHoldMs = 1800 + (int)(dirIntensity * 1800.0f);  // 1.8s ~ 3.6s
+        if (!PostMessageW(emoHwnd, WM_APP_DIRECTOR, 0, (LPARAM)cmd)) delete cmd;
+    }
 
     // ★ TTS 放在"聊天结束"之后再跑：就算合成慢或卡住，也不会把界面卡在"正在思考"。
     //   超长文本默认跳过（合成要等很久），上限默认 600 字，可在 [TTS] TtsMaxChars 调整。
+    //   把情绪传进 TTS，让语速/语调随心情变化（ToneForEmotion）。
+    // ★ 语音走分段流式：这里只负责"投递"，切句与合成都交给后台线程。
+    //   好处有两个：一是第一句合完就能开口（不用等整段 600 字），
+    //   二是 LLM 线程立刻返回，绝不会把界面卡在"正在思考"。
+    //   ttsMax <= 0 表示不限制长度（旧行为是硬跳过，长文就整段哑掉）。
     int ttsMax = GetTtsMaxChars();
     if (!jaReply.empty() && IsWindow(hwnd)) {
-        if ((int)jaReply.size() > ttsMax) {
+        if (ttsMax > 0 && (int)jaReply.size() > ttsMax) {
             TtsLog("skip", "日语 " + std::to_string(jaReply.size())
                 + " 字 > TtsMaxChars=" + std::to_string(ttsMax));
         } else {
-            std::wstring err;
-            if (!CallTTSService(jaReply, &err) && !err.empty()
-                && GetIniInt(L"TTS", L"TtsShowError", 1, 0, 1)) {
-                auto* em = new std::wstring(L"（语音合成失败：" + err + L"，详情见 VS 输出窗口 [TTS]）");
-                if (!PostMessageW(hwnd, WM_APPEND_TEXT, 0, (LPARAM)em)) delete em;
-            }
+            TtsSpeak(jaReply, emo);
         }
     }
 
+    // ★ 主动搭话线程收尾：释放互斥标志，无论成功失败都要还原，否则以后再也不搭话。
+    if (proactive) g_proactiveRunning = false;
+
     return 0;
+}
+
+// ==================================================================
+//  ★附件条 UI + 三入口（拖拽 / Ctrl+V / 📎）
+//  ------------------------------------------------------------------
+//  附件条只在有待发送附件时出现，占 56px，横向排 chip：
+//    [36×36 缩略图 | 文件名 | ✕]
+//  点 ✕ 移除，点文件名用系统默认程序打开原件。
+//  深色主题跟随 g_chatTheme（背景/边框/文字都取主题色）。
+// ==================================================================
+static std::vector<Gdiplus::Image*> g_attachThumbs;   // 与 g_pendingAttachments 同序
+static std::vector<RECT> g_attachChipRects;
+static std::vector<RECT> g_attachCloseRects;
+static int g_attachHover = -1;
+
+static void ChatSetStatus(HWND chat, const std::wstring& text) {
+    if (g_hStatusLabel && IsWindow(g_hStatusLabel)) {
+        SetWindowTextW(g_hStatusLabel, text.c_str());
+        InvalidateRect(g_hStatusLabel, nullptr, TRUE);
+    }
+    (void)chat;
+}
+
+// 当前输入区高度：有附件时整体上移，历史区相应变矮
+static int AttachBarHeight() {
+    return g_pendingAttachments.empty() ? 0 : ATTACH_STRIP_H;
+}
+
+static void LayoutChatChildren(HWND hwnd) {
+    if (!hwnd || !IsWindow(hwnd)) return;
+    if (!g_hHistoryEdit || !g_hInputEdit || !g_hSendBtn) return;
+    RECT rc; GetClientRect(hwnd, &rc);
+    int cx = rc.right, cy = rc.bottom;
+    int attachH = AttachBarHeight();
+    int inputTop = cy - 260;                       // 输入区顶部（和原来一致）
+    int barTop = inputTop - attachH - (attachH ? 6 : 0);
+    if (g_hAttachStrip && IsWindow(g_hAttachStrip)) {
+        if (attachH) {
+            ShowWindow(g_hAttachStrip, SW_SHOW);
+            MoveWindow(g_hAttachStrip, 10, barTop, cx - 20, attachH, TRUE);
+            InvalidateRect(g_hAttachStrip, nullptr, TRUE);
+        } else {
+            ShowWindow(g_hAttachStrip, SW_HIDE);
+        }
+    }
+    int historyH = barTop - 44 - 10;
+    if (historyH < 50) historyH = 50;
+    MoveWindow(g_hHistoryEdit, 10, 44, cx - 20, historyH, TRUE);
+    // 左侧挤出 📎 / 🎤 两枚小按钮
+    MoveWindow(g_hInputEdit, 56, inputTop, cx - 186, 80, TRUE);
+    MoveWindow(g_hSendBtn, cx - 120, inputTop, 100, 35, TRUE);
+    HWND hExit = GetDlgItem(hwnd, 104);
+    if (hExit) MoveWindow(hExit, cx - 120, inputTop + 45, 100, 35, TRUE);
+    HWND hAttach = GetDlgItem(hwnd, ID_BTN_ATTACH);
+    HWND hMic    = GetDlgItem(hwnd, ID_BTN_MIC);
+    if (hAttach) MoveWindow(hAttach, 10, inputTop, 40, 34, TRUE);
+    if (hMic)    MoveWindow(hMic, 10, inputTop + 40, 40, 34, TRUE);
+    HWND hClear = GetDlgItem(hwnd, ID_BTN_CLEAR);
+    HWND hMem   = GetDlgItem(hwnd, ID_BTN_MEMORY);
+    HWND hLF    = GetDlgItem(hwnd, ID_BTN_LONGFORM);
+    HWND hTheme = GetDlgItem(hwnd, ID_BTN_THEME);
+    if (hClear) MoveWindow(hClear, 10, 10, 96, 30, TRUE);
+    if (hMem)   MoveWindow(hMem, 112, 10, 96, 30, TRUE);
+    if (hLF)    MoveWindow(hLF, 214, 10, 96, 30, TRUE);
+    if (hTheme) MoveWindow(hTheme, 316, 10, 96, 30, TRUE);
+    if (g_hStatusLabel)
+        MoveWindow(g_hStatusLabel, 10, cy - 34, cx - 20, 24, TRUE);
+}
+
+// 40×40 缩略图（懒生成，失败返回 nullptr，画成 📄/🎤 图标）
+static Image* MakeThumbImage(const std::wstring& path) {
+    if (path.empty()) return nullptr;
+    Bitmap* src = Bitmap::FromFile(path.c_str());
+    if (!src || src->GetLastStatus() != Ok) { delete src; return nullptr; }
+    Bitmap* dst = new Bitmap(72, 72, PixelFormat32bppARGB);
+    if (!dst || dst->GetLastStatus() != Ok) { delete dst; delete src; return nullptr; }
+    UINT w = src->GetWidth(), h = src->GetHeight();
+    if (w && h) {
+        double scale = (double)72 / (double)((w > h) ? w : h);
+        int nw = (int)(w * scale + 0.5); if (nw < 1) nw = 1;
+        int nh = (int)(h * scale + 0.5); if (nh < 1) nh = 1;
+        Graphics g(dst);
+        g.SetInterpolationMode(InterpolationModeHighQualityBicubic);
+        g.SetPixelOffsetMode(PixelOffsetModeHighQuality);
+        g.Clear(Color(0, 0, 0, 0));
+        g.DrawImage(src, Rect((72 - nw) / 2, (72 - nh) / 2, nw, nh),
+            0, 0, (int)w, (int)h, UnitPixel);
+    }
+    delete src;
+    return dst;
+}
+
+static void ClearAttachThumbs() {
+    for (Image* img : g_attachThumbs) delete img;
+    g_attachThumbs.clear();
+}
+
+static void RebuildAttachThumbs() {
+    ClearAttachThumbs();
+    g_attachThumbs.reserve(g_pendingAttachments.size());
+    for (const Attachment& a : g_pendingAttachments)
+        g_attachThumbs.push_back(a.kind == ATTACH_KIND_IMAGE ? MakeThumbImage(a.path) : nullptr);
+}
+
+// 附件条重绘 + 显隐（AddAttachmentFromPath 之后必须调一次）
+static void RefreshAttachStrip() {
+    RebuildAttachThumbs();
+    g_attachHover = -1;
+    if (g_hAttachStrip && IsWindow(g_hAttachStrip)) InvalidateRect(g_hAttachStrip, nullptr, TRUE);
+    if (g_hChatWnd && IsWindow(g_hChatWnd)) LayoutChatChildren(g_hChatWnd);
+}
+
+static void RemoveAttachmentAt(int idx) {
+    if (idx < 0 || idx >= (int)g_pendingAttachments.size()) return;
+    g_pendingAttachments.erase(g_pendingAttachments.begin() + idx);
+    RefreshAttachStrip();
+    ChatSetStatus(g_hChatWnd, L"已移除附件");
+}
+
+static LRESULT CALLBACK AttachStripProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_CREATE:
+        DragAcceptFiles(hwnd, TRUE);
+        break;
+    case WM_ERASEBKGND:
+        return 1;                                  // 全在 WM_PAINT 里画，避免闪烁
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hwnd, &ps);
+        RECT rc; GetClientRect(hwnd, &rc);
+        const bool dark = (g_chatTheme == 1);
+        const COLORREF bg     = dark ? kChatDarkBg : GetSysColor(COLOR_WINDOW);
+        const COLORREF fg     = dark ? kChatDarkFg : GetSysColor(COLOR_WINDOWTEXT);
+        const COLORREF border = dark ? RGB(84, 84, 100) : RGB(200, 200, 206);
+        const COLORREF hoverC = dark ? RGB(72, 72, 88) : RGB(226, 232, 242);
+
+        HBRUSH bgBr = CreateSolidBrush(bg);
+        FillRect(hdc, &rc, bgBr);
+        DeleteObject(bgBr);
+
+        g_attachChipRects.clear();
+        g_attachCloseRects.clear();
+
+        const int n = (int)g_pendingAttachments.size();
+        const int gap = 6;
+        const int fixedW = 6 + 36 + 8 + 8 + 22 + 6;    // 缩略图/边距/✕ 的固定占用
+        int avail = rc.right - rc.left - 4;
+        int nameW = 120;
+        if (n > 0) {
+            int total = n * (fixedW + nameW) + (n - 1) * gap;
+            if (total > avail) {
+                nameW = (avail - (n - 1) * gap) / n - fixedW;
+                if (nameW < 44) nameW = 44;
+            }
+        }
+        const int chipW = fixedW + nameW;
+        const int chipTop = 8, chipH = 40;
+
+        HFONT font = CreateFontW(-14, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, FF_DONTCARE, L"Segoe UI");
+        HGDIOBJ oldFont = SelectObject(hdc, font);
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, fg);
+
+        int x = 2;
+        for (int i = 0; i < n; ++i) {
+            RECT chip = { x, chipTop, x + chipW, chipTop + chipH };
+            RECT chipClip = chip;
+            if (chipClip.right > rc.right) chipClip.right = rc.right;
+            if (chipClip.left < rc.left) chipClip.left = rc.left;
+            g_attachChipRects.push_back(chip);
+            if (chip.left < rc.right) {
+                HBRUSH cb = CreateSolidBrush(i == g_attachHover ? hoverC : bg);
+                HPEN pen = CreatePen(PS_SOLID, 1, border);
+                HGDIOBJ ob = SelectObject(hdc, cb);
+                HGDIOBJ op = SelectObject(hdc, pen);
+                RoundRect(hdc, chip.left, chip.top, chip.right, chip.bottom, 10, 10);
+                SelectObject(hdc, op);
+                SelectObject(hdc, ob);
+                DeleteObject(pen);
+                DeleteObject(cb);
+
+                RECT thumb = { chip.left + 6, chip.top + 2, chip.left + 42, chip.top + 38 };
+                Image* th = (i < (int)g_attachThumbs.size()) ? g_attachThumbs[i] : nullptr;
+                if (th) {
+                    // Graphics 用完立刻销毁：GDI+ 对象必须早于 EndPaint 释放，
+                    // 否则 DC 已归还、GDI+ 还在往里写，属于未定义行为。
+                    Graphics tg(hdc);
+                    tg.SetInterpolationMode(InterpolationModeHighQualityBicubic);
+                    tg.DrawImage(th, Rect(thumb.left, thumb.top, 36, 36));
+                } else {
+                    const wchar_t* icon = (g_pendingAttachments[i].kind == ATTACH_KIND_VOICE) ? L"🎤"
+                        : (g_pendingAttachments[i].kind == ATTACH_KIND_IMAGE) ? L"🖼" : L"📄";
+                    DrawTextW(hdc, icon, -1, &thumb, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+                }
+
+                RECT nameRc = { chip.left + 46, chip.top + 2, chip.right - 26, chip.top + 38 };
+                std::wstring nm = g_pendingAttachments[i].name;
+                DrawTextW(hdc, nm.c_str(), -1, &nameRc,
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+
+                RECT closeRc = { chip.right - 24, chip.top + 2, chip.right - 4, chip.top + 38 };
+                g_attachCloseRects.push_back(closeRc);
+                SetTextColor(hdc, dark ? RGB(200, 200, 210) : RGB(110, 110, 118));
+                DrawTextW(hdc, L"✕", -1, &closeRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+                SetTextColor(hdc, fg);
+            } else {
+                RECT dummy = { 0, 0, 0, 0 };
+                g_attachCloseRects.push_back(dummy);
+            }
+            x += chipW + gap;
+        }
+        SelectObject(hdc, oldFont);
+        DeleteObject(font);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_MOUSEMOVE: {
+        int mx = (int)(short)LOWORD(lp), my = (int)(short)HIWORD(lp);
+        int hover = -1;
+        for (size_t i = 0; i < g_attachChipRects.size(); ++i) {
+            const RECT& r = g_attachChipRects[i];
+            if (mx >= r.left && mx < r.right && my >= r.top && my < r.bottom) { hover = (int)i; break; }
+        }
+        if (hover != g_attachHover) {
+            g_attachHover = hover;
+            InvalidateRect(hwnd, nullptr, TRUE);
+        }
+        // 让窗口在鼠标移出时收到 WM_MOUSELEAVE，把悬停态清掉
+        TRACKMOUSEEVENT tme{ sizeof(tme), TME_LEAVE, hwnd, 0 };
+        TrackMouseEvent(&tme);
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        if (g_attachHover != -1) { g_attachHover = -1; InvalidateRect(hwnd, nullptr, TRUE); }
+        return 0;
+    case WM_SETCURSOR:
+        if (LOWORD(lp) == HTCLIENT && g_attachHover >= 0) {
+            SetCursor(LoadCursorW(nullptr, IDC_HAND));
+            return TRUE;
+        }
+        break;
+    case WM_LBUTTONUP: {
+        int mx = (int)(short)LOWORD(lp), my = (int)(short)HIWORD(lp);
+        for (size_t i = 0; i < g_attachCloseRects.size(); ++i) {
+            const RECT& r = g_attachCloseRects[i];
+            if (r.right > r.left && mx >= r.left && mx < r.right && my >= r.top && my < r.bottom) {
+                RemoveAttachmentAt((int)i);
+                return 0;
+            }
+        }
+        // ★安全：rect 列表是上一次 WM_PAINT 建的，附件可能在此之前被删掉而尚未重绘，
+        //   此时 rect 数量 > 附件数量，直接下标访问会越界。上限取两者较小值。
+        size_t chipN = min(g_attachChipRects.size(), g_pendingAttachments.size());
+        for (size_t i = 0; i < chipN; ++i) {
+            const RECT& r = g_attachChipRects[i];
+            if (mx >= r.left && mx < r.right && my >= r.top && my < r.bottom) {
+                const Attachment& a = g_pendingAttachments[i];
+                if (!a.path.empty() && PathFileExistsW(a.path.c_str()))
+                    ShellExecuteW(nullptr, L"open", a.path.c_str(), L"", nullptr, SW_SHOWNORMAL);
+                return 0;
+            }
+        }
+        return 0;
+    }
+    case WM_DROPFILES: {
+        // 拖到附件条上也接受，直接转给聊天窗处理
+        if (g_hChatWnd && IsWindow(g_hChatWnd)) {
+            PostMessageW(g_hChatWnd, WM_DROPFILES, wp, lp);
+            return 0;
+        }
+        DragFinish((HDROP)wp);
+        return 0;
+    }
+    case WM_DESTROY:
+        if (g_hAttachStrip == hwnd) g_hAttachStrip = nullptr;
+        break;
+    default: break;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+// ---------------- 三入口用的通用动作 ----------------
+
+// 📎：多选文件对话框
+static void PickAttachmentFiles(HWND owner) {
+    std::vector<wchar_t> buf(64 * 1024, 0);
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = owner;
+    ofn.lpstrFilter =
+        L"支持的文件\0*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.webp;*.txt;*.md;*.log;*.json;*.csv;*.ini;"
+        L"*.yaml;*.yml;*.xml;*.html;*.htm;*.css;*.js;*.ts;*.py;*.cpp;*.c;*.h;*.hpp;*.cs;*.java;"
+        L"*.go;*.rs;*.sql;*.pdf;*.docx;*.xlsx\0"
+        L"图片\0*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.webp\0"
+        L"文档\0*.pdf;*.docx;*.xlsx\0"
+        L"文本 / 代码\0*.txt;*.md;*.json;*.csv;*.ini;*.log;*.py;*.cpp;*.h\0"
+        L"所有文件\0*.*\0";
+    ofn.lpstrFile = buf.data();
+    ofn.nMaxFile = (DWORD)buf.size();
+    ofn.Flags = OFN_ALLOWMULTISELECT | OFN_EXPLORER | OFN_FILEMUSTEXIST |
+        OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    ofn.lpstrTitle = L"选择要发给茉子的图片 / 文件";
+    if (!GetOpenFileNameW(&ofn)) return;
+
+    std::vector<std::wstring> paths;
+    const wchar_t* p = buf.data();
+    std::wstring dir = p;
+    p += dir.size() + 1;
+    if (*p == 0) {
+        paths.push_back(dir);                      // 只选了一个
+    } else {
+        while (*p) {
+            std::wstring f = p;
+            p += f.size() + 1;
+            paths.push_back(dir + L"\\" + f);
+        }
+    }
+    std::wstring firstErr;
+    int added = 0;
+    for (const std::wstring& path : paths) {
+        std::wstring err;
+        if (AddAttachmentFromPath(path, err)) ++added;
+        else if (firstErr.empty()) firstErr = err;
+    }
+    RefreshAttachStrip();
+    if (!firstErr.empty()) ChatSetStatus(owner, L"⚠ " + firstErr);
+    else if (added > 0)    ChatSetStatus(owner, L"已添加 " + std::to_wstring(added) + L" 个附件，按 Enter 发送");
+}
+
+// 剪贴板 DIB → HBITMAP → JPEG base64 附件
+static bool AddClipboardImageAttachment(const void* dib, size_t bytes, std::wstring& err) {
+    int maxFiles = GetIniInt(L"Attach", L"MaxFiles", 4, 1, ATTACH_MAX_FILES);
+    if ((int)g_pendingAttachments.size() >= maxFiles) {
+        err = L"单次最多 " + std::to_wstring(maxFiles) + L" 个附件";
+        return false;
+    }
+    if (!dib || bytes < sizeof(BITMAPINFOHEADER)) { err = L"剪贴板图片数据无效"; return false; }
+    const BITMAPINFOHEADER* bih = (const BITMAPINFOHEADER*)dib;
+    size_t hdrSize = bih->biSize;
+    if (hdrSize < sizeof(BITMAPINFOHEADER)) hdrSize = sizeof(BITMAPINFOHEADER);
+    size_t palSize = 0;
+    if (bih->biBitCount <= 8)
+        palSize = (bih->biClrUsed ? bih->biClrUsed : (1u << bih->biBitCount)) * 4;
+    if (hdrSize + palSize > bytes) { err = L"剪贴板图片数据不完整"; return false; }
+
+    std::vector<BYTE> bmiBuf(hdrSize + palSize + 16, 0);
+    memcpy(bmiBuf.data(), dib, hdrSize + palSize);
+    BITMAPINFO* bmi = (BITMAPINFO*)bmiBuf.data();
+    HDC hdc = GetDC(nullptr);
+    void* bits = nullptr;
+    HBITMAP hbm = CreateDIBSection(hdc, bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (hbm && bits)
+        memcpy(bits, (const BYTE*)dib + hdrSize + palSize, bytes - hdrSize - palSize);
+    ReleaseDC(nullptr, hdc);
+    if (!hbm || !bits) { if (hbm) DeleteObject(hbm); err = L"剪贴板图片转换失败"; return false; }
+
+    Bitmap* bmp = Bitmap::FromHBITMAP(hbm, nullptr);
+    int maxSide = GetIniInt(L"Attach", L"ImageMaxSide", 1280, 512, 2048);
+    Attachment a;
+    bool ok = bmp && bmp->GetLastStatus() == Ok &&
+        EncodeBitmapToJpegBase64(bmp, maxSide, a.b64);
+    if (bmp) delete bmp;
+    DeleteObject(hbm);
+    if (!ok || a.b64.empty()) { err = L"剪贴板图片编码失败"; return false; }
+
+    a.kind = ATTACH_KIND_IMAGE;
+    a.name = L"剪贴板截图";
+    a.mime = "image/jpeg";
+    a.bytes = bytes;
+    a.ok = true;
+    g_pendingAttachments.push_back(a);
+    return true;
+}
+
+// Ctrl+V / 右键粘贴：优先按"文件"处理，其次按"图片"处理
+static bool AttachFromClipboard(HWND owner, std::wstring& err) {
+    if (!IsClipboardFormatAvailable(CF_HDROP) && !IsClipboardFormatAvailable(CF_DIB))
+        return false;
+    if (!OpenClipboard(owner)) { err = L"打开剪贴板失败"; return false; }
+    bool handled = false;
+    if (IsClipboardFormatAvailable(CF_HDROP)) {
+        HDROP hd = (HDROP)GetClipboardData(CF_HDROP);
+        if (hd) {
+            UINT n = DragQueryFileW(hd, 0xFFFFFFFF, nullptr, 0);
+            for (UINT i = 0; i < n; ++i) {
+                wchar_t path[MAX_PATH * 2] = { 0 };
+                if (!DragQueryFileW(hd, i, path, MAX_PATH * 2)) continue;
+                std::wstring e;
+                if (AddAttachmentFromPath(path, e)) handled = true;
+                else if (err.empty()) err = e;
+            }
+        }
+    } else if (IsClipboardFormatAvailable(CF_DIB)) {
+        HANDLE h = GetClipboardData(CF_DIB);
+        if (h) {
+            const void* p = GlobalLock(h);
+            if (p) {
+                SIZE_T sz = GlobalSize(h);
+                handled = AddClipboardImageAttachment(p, (size_t)sz, err);
+                GlobalUnlock(h);
+            }
+        }
+    }
+    CloseClipboard();
+    if (handled) { RefreshAttachStrip(); ChatSetStatus(owner, L"已从剪贴板添加附件"); }
+    return handled;
+}
+
+// ==================================================================
+//  ★附件缓存：图片复制一份到 attach_cache\，历史里可回看
+//  ------------------------------------------------------------------
+//  历史文件本身只写占位符（[图片 a.jpg]），原件按天清理；
+//  右键 📎 → "打开附件缓存目录" 就能找到聊过的图。
+// ==================================================================
+static std::wstring AttachCacheDir() {
+    std::wstring dir;
+    if (!GetExeDir(dir)) return L"";
+    std::wstring cache = dir + L"\\attach_cache";
+    if (!PathFileExistsW(cache.c_str())) CreateDirectoryW(cache.c_str(), nullptr);
+    return cache;
+}
+
+static void PruneDirByDays(const std::wstring& dirPath, int days) {
+    if (dirPath.empty() || days <= 0) return;
+    FILETIME ftNow{};
+    GetSystemTimeAsFileTime(&ftNow);
+    ULARGE_INTEGER uNow;
+    uNow.LowPart = ftNow.dwLowDateTime;
+    uNow.HighPart = ftNow.dwHighDateTime;
+    const ULONGLONG limit = (ULONGLONG)days * 24ULL * 3600ULL * 10000000ULL;
+    std::wstring pattern = dirPath + L"\\*";
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        ULARGE_INTEGER u;
+        u.LowPart = fd.ftLastWriteTime.dwLowDateTime;
+        u.HighPart = fd.ftLastWriteTime.dwHighDateTime;
+        if (uNow.QuadPart > u.QuadPart && (uNow.QuadPart - u.QuadPart) > limit)
+            DeleteFileW((dirPath + L"\\" + fd.cFileName).c_str());
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+}
+
+static void OpenAttachCacheDir() {
+    std::wstring cache = AttachCacheDir();
+    if (cache.empty()) return;
+    ShellExecuteW(nullptr, L"open", cache.c_str(), L"", nullptr, SW_SHOWNORMAL);
+}
+
+// 发送前把图片存进缓存（只存图片；文本/表格已经进历史占位符，没必要留副本）
+static void CacheAttachmentFiles(const std::vector<Attachment>& atts) {
+    int days = GetIniInt(L"Attach", L"CacheDays", 30, 0, 365);
+    if (days <= 0) return;
+    std::wstring cache = AttachCacheDir();
+    if (cache.empty()) return;
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+    int idx = 0;
+    for (const Attachment& a : atts) {
+        if (!a.ok || a.kind != ATTACH_KIND_IMAGE || a.path.empty()) continue;
+        if (!PathFileExistsW(a.path.c_str())) continue;
+        wchar_t prefix[80];
+        swprintf(prefix, 80, L"\\%04d%02d%02d_%02d%02d%02d_%d_",
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, ++idx);
+        std::wstring dst = cache + prefix + a.name;
+        CopyFileW(a.path.c_str(), dst.c_str(), FALSE);
+    }
+    PruneDirByDays(cache, days);
+    // 顺手清掉 %TEMP% 里超过 1 天的录音残留（转写完本来就会删，这里兜底）
+    wchar_t tmp[MAX_PATH] = { 0 };
+    if (GetTempPathW(MAX_PATH, tmp) > 0)
+        PruneDirByDays(std::wstring(tmp) + L"MakotoPetAttach", 1);
+}
+
+// ==================================================================
+//  ★语音输入：waveIn 录音 + 本地 whisper.cpp 转写
+//  ------------------------------------------------------------------
+//  为什么不能直接把音频丢给模型：Agnes 只吃文本+图片，没有音频输入，
+//  所以必须在本地先把语音转成文字，再把文字当普通消息发出去。
+//  转写结果只"填进输入框"，不自动发送——识别错一个字就发出去更糟。
+//  loopback 说明：录音固定 16kHz/16bit/单声道，这是 whisper 的最佳输入。
+// ==================================================================
+#define ID_TIMER_REC 902
+#define ASR_SAMPLE_RATE 16000
+
+static HWAVEIN      g_hWaveIn = nullptr;
+static WAVEHDR      g_recHdr{};
+static std::vector<BYTE> g_recBuf;
+static bool         g_recActive = false;
+static ULONGLONG    g_recStartMs = 0;
+static int          g_recLimitSec = 30;
+static volatile LONG g_asrBusy = 0;          // 1 = 有转写线程在跑
+
+// 找一个可用的 whisper 可执行 + 模型（相对路径按程序目录解析）
+static bool ResolveWhisper(std::wstring& exe, std::wstring& model, std::wstring& err) {
+    std::wstring dir;
+    if (!GetExeDir(dir)) dir.clear();
+    exe   = GetIniStr(L"ASR", L"WhisperExe",   L"whisper-cli.exe");
+    model = GetIniStr(L"ASR", L"WhisperModel", L"ggml-base.bin");
+    // 相对路径依次在 程序目录 / 程序目录\tools / 程序目录\tools\whisper 里找，
+    // 这样默认值 whisper-cli.exe + ggml-base.bin 也能命中我们随包放的位置
+    auto absolutize = [&](std::wstring& p) {
+        if (p.empty()) return;
+        bool absolute = (p.size() > 1 && p[1] == L':') || p[0] == L'\\';
+        if (absolute || dir.empty()) return;
+        const wchar_t* subs[3] = { L"", L"\\tools", L"\\tools\\whisper" };
+        for (int i = 0; i < 3; ++i) {
+            std::wstring cand = dir + subs[i] + L"\\" + p;
+            if (PathFileExistsW(cand.c_str())) { p = cand; return; }
+        }
+    };
+    absolutize(exe);
+    absolutize(model);
+    if (!PathFileExistsW(exe.c_str())) {
+        err = L"找不到 " + exe + L"（放到 程序目录\\tools\\whisper\\ 或 [ASR] WhisperExe 写绝对路径）";
+        return false;
+    }
+    if (!PathFileExistsW(model.c_str())) {
+        err = L"找不到模型 " + model + L"（放到 程序目录\\tools\\whisper\\ 或 [ASR] WhisperModel 写绝对路径）";
+        return false;
+    }
+    return true;
+}
+
+// ==================================================================
+//  ★语音识别加速：常驻 whisper-server
+//   每说一句都起一次 whisper-cli 要重新加载模型（1~3 秒，small 模型更久）；
+//   改成第一次用时把 whisper-server 拉起来常驻内存，之后只发一次 HTTP，
+//   首字延迟能降到 0.3 秒内。server 起不来时自动退回 whisper-cli，功能不受影响。
+// ==================================================================
+static HANDLE    g_asrSrvProc = nullptr;
+static int       g_asrSrvPort = 0;
+static ULONGLONG g_asrSrvLastUse = 0;
+
+static bool AsrServerAlive() {
+    if (!g_asrSrvProc) return false;
+    DWORD ec = 0;
+    if (!GetExitCodeProcess(g_asrSrvProc, &ec) || ec != STILL_ACTIVE) {
+        CloseHandle(g_asrSrvProc);
+        g_asrSrvProc = nullptr;
+        g_asrSrvPort = 0;
+        return false;
+    }
+    return true;
+}
+
+static void AsrServerStop() {
+    if (!g_asrSrvProc) return;
+    TerminateProcess(g_asrSrvProc, 0);
+    WaitForSingleObject(g_asrSrvProc, 3000);
+    CloseHandle(g_asrSrvProc);
+    g_asrSrvProc = nullptr;
+    g_asrSrvPort = 0;
+}
+
+// 端口探活：能拿到 HTTP 响应（哪怕是 404）就算起来了
+static bool AsrServerPing(int port) {
+    HINTERNET s = WinHttpOpenAuto(L"127.0.0.1");
+    if (!s) return false;
+    WinHttpSetTimeouts(s, 600, 600, 600, 600);
+    HINTERNET c = WinHttpConnect(s, L"127.0.0.1", (INTERNET_PORT)port, 0);
+    bool ok = false;
+    if (c) {
+        HINTERNET r = WinHttpOpenRequest(c, L"GET", L"/", nullptr, nullptr, nullptr, 0);
+        if (r) {
+            if (WinHttpSendRequest(r, WINHTTP_NO_ADDITIONAL_HEADERS, 0, nullptr, 0, 0, 0) &&
+                WinHttpReceiveResponse(r, nullptr))
+                ok = true;
+            WinHttpCloseHandle(r);
+        }
+        WinHttpCloseHandle(c);
+    }
+    WinHttpCloseHandle(s);
+    return ok;
+}
+
+static bool AsrServerStart(const std::wstring& cliExe, const std::wstring& model,
+                           int port, const std::wstring& lang, int threads) {
+    size_t slash = cliExe.find_last_of(L"\\/");
+    std::wstring dir = (slash == std::wstring::npos) ? std::wstring() : cliExe.substr(0, slash + 1);
+    std::wstring srv = dir + L"whisper-server.exe";
+    if (!PathFileExistsW(srv.c_str())) return false;
+
+    // ★安全：路径过长时 swprintf 会溢出返回 -1 且可能不以 NUL 结尾，
+    //   随后 std::wstring cmd = args 会越界读。用 _TRUNCATE 版本兜住。
+    wchar_t args[1200];
+    _snwprintf_s(args, 1200, _TRUNCATE,
+             L"\"%s\" -m \"%s\" -t %d -l %s --host 127.0.0.1 --port %d",
+             srv.c_str(), model.c_str(), threads, lang.c_str(), port);
+
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi{};
+    std::wstring cmd = args;
+    if (!CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, FALSE,
+                        CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi))
+        return false;
+    CloseHandle(pi.hThread);
+    g_asrSrvProc = pi.hProcess;
+
+    // 等模型加载完（small 模型首次约 2~4 秒，给 20 秒余量）
+    for (int i = 0; i < 100; ++i) {
+        if (!AsrServerAlive()) return false;
+        if (AsrServerPing(port)) { g_asrSrvPort = port; return true; }
+        Sleep(200);
+    }
+    AsrServerStop();
+    return false;
+}
+
+// 把 wav 以 multipart 形式 POST 到 /inference，解析返回的 {"text":"..."}
+static bool AsrServerInfer(int port, const std::string& wavBytes, std::wstring& out) {
+    out.clear();
+    if (wavBytes.empty()) return false;
+    const char* boundary = "----MakotoPetAsrBoundary7d91";
+    std::string body;
+    body.reserve(wavBytes.size() + 512);
+    body += "--"; body += boundary; body += "\r\n";
+    body += "Content-Disposition: form-data; name=\"file\"; filename=\"voice.wav\"\r\n";
+    body += "Content-Type: audio/wav\r\n\r\n";
+    body.append(wavBytes);
+    body += "\r\n--"; body += boundary; body += "\r\n";
+    body += "Content-Disposition: form-data; name=\"response_format\"\r\n\r\njson\r\n";
+    body += "--"; body += boundary; body += "--\r\n";
+
+    HINTERNET s = WinHttpOpenAuto(L"127.0.0.1");
+    if (!s) return false;
+    WinHttpSetTimeouts(s, 5000, 5000, 60000, 60000);
+    HINTERNET c = WinHttpConnect(s, L"127.0.0.1", (INTERNET_PORT)port, 0);
+    if (!c) { WinHttpCloseHandle(s); return false; }
+    HINTERNET r = WinHttpOpenRequest(c, L"POST", L"/inference", nullptr, nullptr, nullptr, 0);
+    if (!r) { WinHttpCloseHandle(c); WinHttpCloseHandle(s); return false; }
+
+    std::wstring hdr = L"Content-Type: multipart/form-data; boundary=";
+    hdr += Utf8ToWideString(boundary);
+    BOOL sent = WinHttpSendRequest(r, hdr.c_str(), (DWORD)-1,
+                                   (LPVOID)body.data(), (DWORD)body.size(), (DWORD)body.size(), 0);
+    bool ok = false;
+    if (sent && WinHttpReceiveResponse(r, nullptr)) {
+        std::string resp;
+        char buf[4096];
+        DWORD n = 0;
+        while (WinHttpReadData(r, buf, sizeof buf, &n) && n > 0) {
+            resp.append(buf, n);
+            if (resp.size() > 4u * 1024u * 1024u) break;
+        }
+        if (!resp.empty()) {
+            std::string text = ExtractJsonString(resp, "text");
+            if (!text.empty()) {
+                std::wstring w = Utf8ToWideString(text);
+                // 与 whisper-cli 路径保持一致：分句/换行统一压成一行（说话内容塞进输入框）
+                std::wstring one;
+                one.reserve(w.size());
+                // 变量名用 ch：外层已有 HINTERNET c，避免遮蔽
+                for (wchar_t ch : w) {
+                    if (ch == L'\r' || ch == L'\n') {
+                        if (!one.empty() && one.back() != L' ') one += L' ';
+                    } else {
+                        one += ch;
+                    }
+                }
+                size_t b = one.find_first_not_of(L" \t");
+                size_t e = one.find_last_not_of(L" \t");
+                out = (b == std::wstring::npos) ? L"" : one.substr(b, e - b + 1);
+                ok = !out.empty();
+            }
+        }
+    }
+    WinHttpCloseHandle(r);
+    WinHttpCloseHandle(c);
+    WinHttpCloseHandle(s);
+    if (ok) g_asrSrvLastUse = GetTickCount64();
+    return ok;
+}
+
+// 16k/16bit/mono PCM 写成标准 WAV（whisper 只吃文件）
+static std::wstring WriteTempWav(const BYTE* pcm, DWORD bytes) {
+    wchar_t tmp[MAX_PATH] = { 0 };
+    if (GetTempPathW(MAX_PATH, tmp) == 0) return L"";
+    std::wstring dir = std::wstring(tmp) + L"MakotoPetAttach";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    wchar_t name[64];
+    swprintf(name, 64, L"\\voice_%llu.wav", (unsigned long long)GetTickCount64());
+    std::wstring path = dir + name;
+
+    FILE* f = nullptr;
+    _wfopen_s(&f, path.c_str(), L"wb");
+    if (!f) return L"";
+    const DWORD rate = ASR_SAMPLE_RATE;
+    const WORD  ch = 1, bits = 16;
+    const DWORD byteRate = rate * ch * bits / 8;
+    const WORD  blockAlign = (WORD)(ch * bits / 8);
+    const DWORD dataLen = bytes;
+    const DWORD riffLen = 36 + dataLen;
+
+    BYTE hdr[44] = { 0 };
+    memcpy(hdr, "RIFF", 4);
+    memcpy(hdr + 4, &riffLen, 4);
+    memcpy(hdr + 8, "WAVEfmt ", 8);
+    DWORD fmtLen = 16; memcpy(hdr + 16, &fmtLen, 4);
+    WORD fmtTag = 1;   memcpy(hdr + 20, &fmtTag, 2);
+    memcpy(hdr + 22, &ch, 2);
+    memcpy(hdr + 24, &rate, 4);
+    memcpy(hdr + 28, &byteRate, 4);
+    memcpy(hdr + 32, &blockAlign, 2);
+    memcpy(hdr + 34, &bits, 2);
+    memcpy(hdr + 36, "data", 4);
+    memcpy(hdr + 40, &dataLen, 4);
+    fwrite(hdr, 1, sizeof hdr, f);
+    if (bytes) fwrite(pcm, 1, bytes, f);
+    fclose(f);
+    return path;
+}
+
+// 跑子进程并抓 stdout+stderr（whisper-cli 把识别结果打到标准输出）
+static bool RunProcessCapture(const std::wstring& cmdLine, DWORD timeoutMs, std::string& out) {
+    out.clear();
+    if (cmdLine.empty()) return false;
+    SECURITY_ATTRIBUTES sa{ sizeof(sa), nullptr, TRUE };
+    HANDLE rd = nullptr, wr = nullptr;
+    if (!CreatePipe(&rd, &wr, &sa, 0)) return false;
+    SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+    HANDLE hNul = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+        &sa, OPEN_EXISTING, 0, nullptr);
+
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    si.hStdOutput = wr;
+    si.hStdError = wr;
+    si.hStdInput = (hNul != INVALID_HANDLE_VALUE) ? hNul : nullptr;
+
+    PROCESS_INFORMATION pi{};
+    std::wstring cmd = cmdLine;
+    BOOL started = CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, TRUE,
+        CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+    CloseHandle(wr);
+    if (hNul != INVALID_HANDLE_VALUE) CloseHandle(hNul);
+    if (!started) { CloseHandle(rd); return false; }
+
+    char buf[4096];
+    DWORD n = 0;
+    ULONGLONG start = GetTickCount64();
+    bool killed = false;
+    for (;;) {
+        DWORD avail = 0;
+        if (PeekNamedPipe(rd, nullptr, 0, nullptr, &avail, nullptr) && avail > 0) {
+            if (ReadFile(rd, buf, sizeof buf, &n, nullptr) && n > 0) {
+                out.append(buf, n);
+                continue;
+            }
+            break;      // 读失败/读到 0：别在循环里空转
+        }
+        DWORD w = WaitForSingleObject(pi.hProcess, 80);
+        if (w == WAIT_OBJECT_0) {
+            while (PeekNamedPipe(rd, nullptr, 0, nullptr, &avail, nullptr) && avail > 0) {
+                if (!ReadFile(rd, buf, sizeof buf, &n, nullptr) || n == 0) break;
+                out.append(buf, n);
+            }
+            break;
+        }
+        if (GetTickCount64() - start > timeoutMs) {
+            TerminateProcess(pi.hProcess, 1);
+            killed = true;
+            break;
+        }
+    }
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    CloseHandle(rd);
+    return !killed && !out.empty();
+}
+
+// whisper 的日志行混在结果里，按行过滤，只留真正的转写文本
+static std::wstring CleanWhisperOutput(const std::string& raw) {
+    std::wstring all = Utf8ToWideString(raw);
+    std::wstring out;
+    size_t pos = 0;
+    while (pos < all.size()) {
+        size_t nl = all.find(L'\n', pos);
+        std::wstring line = (nl == std::wstring::npos) ? all.substr(pos) : all.substr(pos, nl - pos);
+        pos = (nl == std::wstring::npos) ? all.size() : nl + 1;
+        while (!line.empty() && (line.back() == L'\r' || line.back() == L' ')) line.pop_back();
+        size_t b = line.find_first_not_of(L' ');
+        if (b == std::wstring::npos) continue;
+        line = line.substr(b);
+        if (line.empty()) continue;
+        // 过滤 whisper 自身的日志/时间戳
+        if (line[0] == L'[') continue;
+        if (line.find(L"whisper_") != std::wstring::npos) continue;
+        if (line.find(L"ggml_") != std::wstring::npos) continue;
+        if (line.find(L"main:") == 0) continue;
+        if (line.find(L"system_info") != std::wstring::npos) continue;
+        if (line.find(L"error:") == 0 || line.find(L"failed") != std::wstring::npos) continue;
+        if (!out.empty()) out += L' ';
+        out += line;
+    }
+    return out;
+}
+
+// 后台转写线程：绝不能在 UI 线程里等 whisper（base 模型也要几秒）
+struct AsrTask {
+    std::wstring wav;
+    HWND hwnd = nullptr;
+};
+
+static unsigned __stdcall AsrThreadProc(void* p) {
+    AsrTask* t = (AsrTask*)p;
+    if (!t) return 0;
+    std::wstring wav = t->wav;
+    HWND hwnd = t->hwnd;
+    delete t;
+
+    std::wstring exe, model, err;
+    std::wstring result;
+    if (!ResolveWhisper(exe, model, err)) {
+        result = L"⚠ " + err;
+    } else {
+        std::wstring lang = GetIniStr(L"ASR", L"Language", L"zh");
+        int threads = GetIniInt(L"ASR", L"Threads", 4, 1, 32);
+        bool done = false;
+
+        // ① 常驻服务优先：模型只加载一次，之后每句只发一次 HTTP
+        if (GetIniInt(L"ASR", L"ServerMode", 1, 0, 1) != 0) {
+            int port = GetIniInt(L"ASR", L"ServerPort", 8791, 1024, 65535);
+            std::string wavBytes;
+            if (ReadWholeFileBytes(wav, 32u * 1024u * 1024u, wavBytes)) {
+                bool needStart = !AsrServerAlive() || g_asrSrvPort != port;
+                bool started = true;
+                if (needStart) {
+                    AsrServerStop();
+                    started = AsrServerStart(exe, model, port, lang, threads);
+                }
+                if (started && g_asrSrvPort == port) {
+                    std::wstring srvText;
+                    if (AsrServerInfer(port, wavBytes, srvText)) {
+                        result = srvText;
+                        done = true;
+                    }
+                }
+            }
+        }
+
+        // ② 服务不可用（没装 whisper-server / 端口被占）：退回一次性调用 whisper-cli
+        if (!done) {
+            // ★安全：模型/音频路径可能很长，固定缓冲需 _TRUNCATE 防未终止串
+            wchar_t tail[1024];
+            _snwprintf_s(tail, 1024, _TRUNCATE, L" -m \"%s\" -f \"%s\" -l %s -nt -np -t %d",
+                model.c_str(), wav.c_str(), lang.c_str(), threads);
+            std::string raw;
+            if (RunProcessCapture(L"\"" + exe + L"\"" + tail, 120000, raw)) {
+                result = CleanWhisperOutput(raw);
+            } else {
+                result = L"⚠ 语音识别失败（whisper 没跑起来或超时，DebugView 可看输出）";
+            }
+        }
+    }
+    DeleteFileW(wav.c_str());          // 音频用完即删，不留隐私
+    InterlockedExchange(&g_asrBusy, 0);
+
+    auto* msg = new std::wstring(result);
+    if (!PostMessageW(hwnd, WM_APP_ASR_DONE, 0, (LPARAM)msg)) delete msg;
+    return 0;
+}
+
+static bool VoiceStartRecording(HWND owner) {
+    if (g_recActive) return true;
+    if (InterlockedCompareExchange(&g_asrBusy, 0, 0) != 0) {
+        ChatSetStatus(owner, L"上一次识别还没结束，稍等一下…");
+        return false;
+    }
+    if (GetIniInt(L"ASR", L"Enable", 0, 0, 1) == 0) {
+        ChatSetStatus(owner, L"语音输入未开启：右键桌宠 → ⚙ 设置 → 附件·输入 → 语音输入开关");
+        return false;
+    }
+    int engine = GetIniInt(L"ASR", L"Engine", 1, 0, 2);
+    if (engine == 0) {
+        ChatSetStatus(owner, L"[ASR] Engine=0 表示关闭；改成 1 使用本地 whisper");
+        return false;
+    }
+    if (engine == 2) {
+        ChatSetStatus(owner, L"云端识别暂未开放，请把 [ASR] Engine 改成 1 用本地 whisper");
+        return false;
+    }
+    std::wstring exe, model, err;
+    if (!ResolveWhisper(exe, model, err)) { ChatSetStatus(owner, L"⚠ " + err); return false; }
+    TtsStopAll();      // 先掐掉茉子的语音，否则麦克风会把她的声音一起录进去
+
+    WAVEFORMATEX wf{};
+    wf.wFormatTag = WAVE_FORMAT_PCM;
+    wf.nChannels = 1;
+    wf.nSamplesPerSec = ASR_SAMPLE_RATE;
+    wf.wBitsPerSample = 16;
+    wf.nBlockAlign = (WORD)(wf.nChannels * wf.wBitsPerSample / 8);
+    wf.nAvgBytesPerSec = wf.nSamplesPerSec * wf.nBlockAlign;
+    wf.cbSize = 0;
+    if (waveInOpen(&g_hWaveIn, WAVE_MAPPER, &wf, 0, 0, CALLBACK_NULL) != MMSYSERR_NOERROR) {
+        g_hWaveIn = nullptr;
+        ChatSetStatus(owner, L"打不开麦克风（检查 设置→隐私→麦克风 权限）");
+        return false;
+    }
+    g_recLimitSec = GetIniInt(L"ASR", L"MaxSeconds", 30, 5, 120);
+    g_recBuf.assign((size_t)wf.nAvgBytesPerSec * (size_t)g_recLimitSec, 0);
+    ZeroMemory(&g_recHdr, sizeof(g_recHdr));
+    g_recHdr.lpData = (LPSTR)g_recBuf.data();
+    g_recHdr.dwBufferLength = (DWORD)g_recBuf.size();
+    if (waveInPrepareHeader(g_hWaveIn, &g_recHdr, sizeof(g_recHdr)) != MMSYSERR_NOERROR ||
+        waveInAddBuffer(g_hWaveIn, &g_recHdr, sizeof(g_recHdr)) != MMSYSERR_NOERROR ||
+        waveInStart(g_hWaveIn) != MMSYSERR_NOERROR) {
+        waveInReset(g_hWaveIn);
+        waveInClose(g_hWaveIn);
+        g_hWaveIn = nullptr;
+        ChatSetStatus(owner, L"录音启动失败（麦克风被其它程序占用？）");
+        return false;
+    }
+    g_recActive = true;
+    g_recStartMs = GetTickCount64();
+    if (owner) {
+        SetTimer(owner, ID_TIMER_REC, 200, nullptr);
+        SetButtonText(owner, ID_BTN_MIC, L"⏹");
+        ChatSetStatus(owner, L"🎤 正在录音… 再点一次结束（最长 " + std::to_wstring(g_recLimitSec) + L" 秒）");
+    }
+    return true;
+}
+
+static void VoiceStopRecording(HWND owner, bool transcribe) {
+    if (!g_recActive || !g_hWaveIn) return;
+    g_recActive = false;
+    waveInStop(g_hWaveIn);
+    waveInReset(g_hWaveIn);                       // 让 dwBytesRecorded 变成实际收到的字节数
+    DWORD recorded = g_recHdr.dwBytesRecorded;
+    // ★安全：dwBytesRecorded 由音频驱动填写，正常不会超过 dwBufferLength，
+    //   但异常驱动可能给出越界值；下游按该长度读 g_recBuf，必须钳到实际缓冲大小。
+    if (recorded > (DWORD)g_recBuf.size()) recorded = (DWORD)g_recBuf.size();
+    waveInUnprepareHeader(g_hWaveIn, &g_recHdr, sizeof(g_recHdr));
+    waveInClose(g_hWaveIn);
+    g_hWaveIn = nullptr;
+    if (owner) {
+        KillTimer(owner, ID_TIMER_REC);
+        SetButtonText(owner, ID_BTN_MIC, L"🎤");
+    }
+    if (!transcribe) return;
+    // 少于 0.1 秒基本是误触
+    if (recorded < (DWORD)(ASR_SAMPLE_RATE * 2 / 10)) {
+        ChatSetStatus(owner, L"录音太短，已取消");
+        return;
+    }
+    std::wstring wav = WriteTempWav(g_recBuf.data(), recorded);
+    if (wav.empty()) { ChatSetStatus(owner, L"保存录音失败"); return; }
+    ChatSetStatus(owner, L"正在识别语音…（本地 whisper，第一次会慢一点）");
+    InterlockedExchange(&g_asrBusy, 1);
+    AsrTask* t = new AsrTask();
+    t->wav = wav;
+    t->hwnd = owner;
+    unsigned int tid = 0;
+    if (!_beginthreadex(nullptr, 0, AsrThreadProc, t, 0, &tid)) {
+        delete t;
+        InterlockedExchange(&g_asrBusy, 0);
+        DeleteFileW(wav.c_str());
+        ChatSetStatus(owner, L"启动识别线程失败");
+    }
+}
+
+static void VoiceAbortRecording() {
+    if (g_recActive) VoiceStopRecording(g_hChatWnd, false);
+}
+
+static void ToggleVoiceRecord(HWND hwnd) {
+    if (g_recActive) VoiceStopRecording(hwnd, true);
+    else             VoiceStartRecording(hwnd);
 }
 
 static LRESULT CALLBACK ChatWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_CREATE: {
+        // 缓存失效：新建聊天窗口时重新读 prompt.txt，外部改过人设无需重启程序。
+        InvalidatePromptCache();
+        // ★ 主题必须在建控件之前读：否则按钮标题（🌙/☀️）会和实际主题对不上
+        g_chatTheme = GetUIConfigInt(L"ChatTheme", 0, 0, 1);
         g_hHistoryEdit = CreateWindowExW(0, L"RICHEDIT50W", L"",
             WS_CHILD | WS_VISIBLE | WS_BORDER | ES_MULTILINE | WS_VSCROLL | ES_AUTOVSCROLL | ES_READONLY | ES_NOHIDESEL,
-            10, 10, 460, 240, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+            10, 44, 460, 240, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
         g_hInputEdit = CreateWindowExW(0, L"RICHEDIT50W", L"",
             WS_CHILD | WS_VISIBLE | WS_BORDER | ES_MULTILINE | WS_VSCROLL | ES_WANTRETURN,
-            10, 260, 350, 80, hwnd, (HMENU)102, GetModuleHandleW(nullptr), nullptr);
+            10, 324, 350, 80, hwnd, (HMENU)102, GetModuleHandleW(nullptr), nullptr);
         g_hSendBtn = CreateWindowExW(0, L"BUTTON", L"发送",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            370, 260, 100, 35, hwnd, (HMENU)103, GetModuleHandleW(nullptr), nullptr);
+            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+            370, 324, 100, 35, hwnd, (HMENU)103, GetModuleHandleW(nullptr), nullptr);
         CreateWindowExW(0, L"BUTTON", L"退出",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            370, 305, 100, 35, hwnd, (HMENU)104, GetModuleHandleW(nullptr), nullptr);
-        HFONT hFont = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, FF_DONTCARE, L"Segoe UI Emoji");
-        SendMessageW(g_hHistoryEdit, WM_SETFONT, (WPARAM)hFont, TRUE);
-        SendMessageW(g_hInputEdit, WM_SETFONT, (WPARAM)hFont, TRUE);
+            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+            370, 369, 100, 35, hwnd, (HMENU)104, GetModuleHandleW(nullptr), nullptr);
+        // 顶栏三个小按钮：清空对话 / 记忆 / 长文·短文切换
+        CreateWindowExW(0, L"BUTTON", L"🗑 清空对话",
+            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+            10, 10, 96, 30, hwnd, (HMENU)ID_BTN_CLEAR, GetModuleHandleW(nullptr), nullptr);
+        CreateWindowExW(0, L"BUTTON", L"🧠 记忆",
+            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+            112, 10, 96, 30, hwnd, (HMENU)ID_BTN_MEMORY, GetModuleHandleW(nullptr), nullptr);
+        {
+            // 三态循环：自动(2) → 短文(0) → 长文(1) → 自动(2)，可回到默认"自动"。
+            int lv = GetLLMConfigInt(L"LongFormManual", 2, 0, 2);
+            const wchar_t* lbl = (lv == 1) ? L"📜 长文" : (lv == 0) ? L"📄 短文" : L"🔀 自动";
+            CreateWindowExW(0, L"BUTTON", lbl,
+                WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+                214, 10, 96, 30, hwnd, (HMENU)ID_BTN_LONGFORM, GetModuleHandleW(nullptr), nullptr);
+        }
+        // 主题切换按钮（🌙 深色 / ☀️ 浅色），点击即时切换并写回 [UI] ChatTheme 持久化
+        CreateWindowExW(0, L"BUTTON", g_chatTheme ? L"☀️ 浅色" : L"🌙 深色",
+            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+            316, 10, 96, 30, hwnd, (HMENU)ID_BTN_THEME, GetModuleHandleW(nullptr), nullptr);
+        // ★附件：📎 选文件 / 🎤 语音输入（两条入口与拖拽、粘贴共用 AppendAttachment）
+        CreateWindowExW(0, L"BUTTON", L"📎",
+            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+            10, 324, 40, 34, hwnd, (HMENU)ID_BTN_ATTACH, GetModuleHandleW(nullptr), nullptr);
+        CreateWindowExW(0, L"BUTTON", L"🎤",
+            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+            10, 364, 40, 34, hwnd, (HMENU)ID_BTN_MIC, GetModuleHandleW(nullptr), nullptr);
+        // ★附件条：自绘的横条，有附件才显示
+        {
+            WNDCLASSEXW sac = { sizeof(WNDCLASSEXW) };
+            sac.lpfnWndProc = AttachStripProc;
+            sac.hInstance = GetModuleHandleW(nullptr);
+            sac.lpszClassName = L"MakotoAttachStrip";
+            sac.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+            RegisterClassExW(&sac);      // 已注册会返回 0，忽略即可
+            g_hAttachStrip = CreateWindowExW(0, L"MakotoAttachStrip", L"",
+                WS_CHILD, 10, 264, 460, ATTACH_STRIP_H,
+                hwnd, (HMENU)ID_ATTACH_STRIP, GetModuleHandleW(nullptr), nullptr);
+        }
+        // ★拖拽入口：整个聊天窗接受文件（子控件区域由系统沿父链找到本窗）
+        DragAcceptFiles(hwnd, TRUE);
+        // 底部状态栏（"茉子正在思考…"动态省略号 / 打字机跳过提示）
+        g_hStatusLabel = CreateWindowExW(0, L"STATIC", L"",
+            WS_CHILD | WS_VISIBLE | SS_LEFT,
+            10, 410, 460, 22, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+        // 字号/字体/主题可配（[UI] ChatFontPt / ChatFontFace / ChatTheme），缺省沿用旧值
+        {
+            int pt = GetUIConfigInt(L"ChatFontPt", 16, 8, 40);
+            std::wstring face = GetUIConfigStr(L"ChatFontFace", L"Segoe UI Emoji");
+            if (face.empty()) face = L"Segoe UI Emoji";
+            HFONT hFont = CreateFontW(pt, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, FF_DONTCARE, face.c_str());
+            SendMessageW(g_hHistoryEdit, WM_SETFONT, (WPARAM)hFont, TRUE);
+            SendMessageW(g_hInputEdit, WM_SETFONT, (WPARAM)hFont, TRUE);
+            if (g_hStatusLabel) SendMessageW(g_hStatusLabel, WM_SETFONT, (WPARAM)hFont, TRUE);
+            // 自绘按钮共用同一字体，文字风格才统一（DrawChatButton 里取 WM_GETFONT）
+            {
+                const int btnIds[] = { ID_BTN_CLEAR, ID_BTN_MEMORY, ID_BTN_LONGFORM, ID_BTN_THEME,
+                    ID_BTN_ATTACH, ID_BTN_MIC, 103, 104 };
+                for (int id : btnIds) {
+                    HWND b = GetDlgItem(hwnd, id);
+                    if (b) SendMessageW(b, WM_SETFONT, (WPARAM)hFont, TRUE);
+                }
+            }
+            // 主题背景在 ApplyChatTheme 里统一处理（EM_SETBKGNDCOLOR，见下方调用）
+        }
         std::wstring history = LoadChatHistory();
+        g_streamCr = false; g_nlRun = 0;        // 新的一次会话，换行记账清零
         SetWindowTextW(g_hHistoryEdit, history.empty() ? L"（暂无对话历史，开始和茉子聊天吧~）\r\n\r\n" : history.c_str());
+        // ★主题 + 载入历史后按块前缀整体重上色（ApplyChatTheme 内部会调 ColorizeFullHistory）
+        ApplyChatTheme(hwnd);
         SendMessageW(g_hHistoryEdit, EM_LINESCROLL, 0, 10000);
+        // 状态栏动画：每 250ms 刷一次"茉子正在思考…"的动态省略号
+        SetTimer(hwnd, ID_TIMER_STATUS, 250, nullptr);
+        // 子类化输入框：Enter 发送 / Shift+Enter 换行 / Esc 关窗
+        //   ★修正：窗口关闭后重建时 g_oldInputProc 仍非空，原写法会跳过子类化，
+        //   导致第二次开聊天窗后 Enter 和 Ctrl+V 附件全部失效。每次新建都必须重挂。
+        if (g_hInputEdit)
+            g_oldInputProc = (WNDPROC)SetWindowLongPtrW(g_hInputEdit, GWLP_WNDPROC, (LONG_PTR)InputSubclassProc);
+        LayoutChatChildren(hwnd);       // 首次布局：📎/🎤 + 附件条位置
         break;
     }
     case WM_SIZE: {
-        if (g_hHistoryEdit && g_hInputEdit && g_hSendBtn) {
-            int cx = LOWORD(lParam), cy = HIWORD(lParam);
-            int historyH = cy - 270;
-            if (historyH < 50) historyH = 50;
-            MoveWindow(g_hHistoryEdit, 10, 10, cx - 20, historyH, TRUE);
-            MoveWindow(g_hInputEdit, 10, cy - 260, cx - 140, 80, TRUE);
-            MoveWindow(g_hSendBtn, cx - 120, cy - 260, 100, 35, TRUE);
-            HWND hExitBtn = GetDlgItem(hwnd, 104);
-            if (hExitBtn) MoveWindow(hExitBtn, cx - 120, cy - 215, 100, 35, TRUE);
-        }
+        // 布局集中到 LayoutChatChildren：多了附件条和 📎/🎤 两枚按钮，
+        // 尺寸变化时整块重排，避免两处逻辑各改一半。
+        LayoutChatChildren(hwnd);
         break;
     }
     case WM_GETMINMAXINFO: {
         MINMAXINFO* mmi = (MINMAXINFO*)lParam;
-        mmi->ptMinTrackSize.x = 400; mmi->ptMinTrackSize.y = 350;
+        // ★加了附件条（56px）之后 350 太矮：历史区会被压到 50px 并盖住附件条，
+        //   抬到 430 保证「历史区 + 附件条 + 输入区 + 状态栏」都放得下。
+        mmi->ptMinTrackSize.x = 400; mmi->ptMinTrackSize.y = 430;
         break;
     }
+    // 聊天窗位置/尺寸变化：静默 0.8s 后落盘（主窗定时器里 MaybeSaveChatGeom 推进）
+    case WM_WINDOWPOSCHANGED: {
+        WINDOWPOS* pwp = (WINDOWPOS*)lParam;
+        if (pwp && !(pwp->flags & (SWP_NOMOVE | SWP_NOSIZE))) MarkChatGeomDirty();
+        break;
+    }
+    // 打字机跳过：聊天窗显示中，点一下（左键）立刻把剩余全文灌入。
+    //   受 [UI] TypewriterSkipMode 控制（0=禁用跳过，1/2=允许）。
+    case WM_LBUTTONDOWN:
+        if (g_typewriting && GetUIConfigInt(L"TypewriterSkipMode", 1, 0, 2) != 0) {
+            g_typewriterSkip.store(true);
+            if (g_hStatusLabel && IsWindow(g_hStatusLabel))
+                SetWindowTextW(g_hStatusLabel, L"");
+            return 0;
+        }
+        break;
     case WM_APPEND_TEXT: {
         std::wstring* text = (std::wstring*)lParam;
-        if (text && g_hHistoryEdit) {
-            DWORD end = GetWindowTextLengthW(g_hHistoryEdit);
-            SendMessageW(g_hHistoryEdit, EM_SETSEL, (WPARAM)end, (LPARAM)end);
-            SendMessageW(g_hHistoryEdit, EM_REPLACESEL, TRUE, (LPARAM)text->c_str());
-            SendMessageW(g_hHistoryEdit, EM_LINESCROLL, 0, 10000);
+        if (text) {
+            // 记录追加前的 cp，给新内容上色（茉子粉色）
+            long cp = (g_hHistoryEdit && IsWindow(g_hHistoryEdit)) ? GetWindowTextLengthW(g_hHistoryEdit) : 0;
+            // 同一轮回复里的补充说明（例如语音合成失败），不额外分段
+            AppendHistoryText(*text);
+            if (g_hHistoryEdit && IsWindow(g_hHistoryEdit)) {
+                LONG c; DWORD e; ColorForPrefix(L"茉子：", c, e);   // ★主题感知的朱红
+                ColorizeRange(g_hHistoryEdit, cp, GetWindowTextLengthW(g_hHistoryEdit), c, e);
+            }
+            delete text;
         }
-        delete text; break;
+        break;
     }
     case WM_REMOVE_THINKING:
         if (g_hHistoryEdit) {
             int len = GetWindowTextLengthW(g_hHistoryEdit);
-            std::wstring currentText(len, L'\0');
+            if (len < 0) len = 0;
+            // 按 len+1 分配（含 NUL），写完再收回到 len；
+            // 只分配 len 却告诉 API 有 len+1 空间是未定义行为。
+            std::wstring currentText((size_t)len + 1, L'\0');
             GetWindowTextW(g_hHistoryEdit, &currentText[0], len + 1);
+            currentText.resize((size_t)len);
             // 只认紧跟在换行后的标签：用户正文里也可能出现"茉子："三个字，
             // 单纯 rfind(L"茉子：") 会把历史从用户那句话中间截断。
             size_t pos = currentText.rfind(L"茉子：");
@@ -3557,91 +8823,595 @@ static LRESULT CALLBACK ChatWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                 (currentText[pos - 1] == L'\n' || currentText[pos - 1] == L'\r')) {
                 currentText.erase(pos + 3);
                 SetWindowTextW(g_hHistoryEdit, currentText.c_str());
+                // ★SetWindowTextW 会把整篇的字符格式重置成默认色，
+                //   不重新上色的话，出错一次之后整段历史就全变黑/全变灰了。
+                ApplyChatTheme(hwnd);
             }
         }
         break;
     case WM_APPEND_CHAR: {
         std::wstring* str = (std::wstring*)lParam;
-        if (str && g_hHistoryEdit) {
-            DWORD end = GetWindowTextLengthW(g_hHistoryEdit);
-            SendMessageW(g_hHistoryEdit, EM_SETSEL, (WPARAM)end, (LPARAM)end);
-            SendMessageW(g_hHistoryEdit, EM_REPLACESEL, TRUE, (LPARAM)str->c_str());
-            SendMessageW(g_hHistoryEdit, EM_LINESCROLL, 0, 10000);
+        if (str) {
+            // 打字机分片也上色（茉子粉色）：记录追加前后 cp
+            long cp = (g_hHistoryEdit && IsWindow(g_hHistoryEdit)) ? GetWindowTextLengthW(g_hHistoryEdit) : 0;
+            // 打字机分片：逐块规范化换行（跨块的 \r / \n 由 g_streamCr 记账）
+            AppendHistoryText(*str);
+            if (g_hHistoryEdit && IsWindow(g_hHistoryEdit)) {
+                LONG c; DWORD e; ColorForPrefix(L"茉子：", c, e);   // ★主题感知的朱红
+                ColorizeRange(g_hHistoryEdit, cp, GetWindowTextLengthW(g_hHistoryEdit), c, e);
+            }
+            delete str;
         }
-        delete str; break;
+        break;
+    }
+    case WM_LOCATE_PROACTIVE: {
+        // 点击主动搭话气泡 -> 滚到最后一条"（主动搭话）茉子："记录并高亮选中。
+        if (g_hHistoryEdit && IsWindow(g_hHistoryEdit)) {
+            int len = GetWindowTextLengthW(g_hHistoryEdit);
+            std::wstring text(len + 1, L'\0');
+            GetWindowTextW(g_hHistoryEdit, &text[0], len + 1);
+            text.resize(len);
+            size_t pos = text.rfind(L"（主动搭话）茉子：");
+            if (pos == std::wstring::npos) {
+                // 找不到标注就退而求其次滚到末尾
+                SendMessageW(g_hHistoryEdit, EM_LINESCROLL, 0, 10000);
+            } else {
+                // 让该行滚动到可视区域顶部附近，并选中这段便于扫读。
+                // 用 (std::min) 加括号，绕开 windows.h 的 min 宏。
+                size_t selEnd = pos + 40; if (selEnd > text.size()) selEnd = text.size();
+                SendMessageW(g_hHistoryEdit, EM_SETSEL, (WPARAM)pos, (LPARAM)selEnd);
+                SendMessageW(g_hHistoryEdit, EM_SCROLLCARET, 0, 0);
+            }
+        }
+        break;
     }
     case WM_STREAM_DONE: {
-        std::wstring* fullReply = (std::wstring*)lParam;
-        if (fullReply) {
-            int len = GetWindowTextLengthW(g_hHistoryEdit);
-            std::wstring currentText(len, L'\0');
-            GetWindowTextW(g_hHistoryEdit, &currentText[0], len + 1);
-            size_t thinkPos = currentText.rfind(L"思考中...");
-            if (thinkPos != std::wstring::npos && thinkPos >= 3) {
-                currentText.erase(thinkPos - 3, currentText.length() - (thinkPos - 3));
-                currentText += L"（未收到回复）";
-                SetWindowTextW(g_hHistoryEdit, currentText.c_str());
-            }
-            size_t pos = currentText.rfind(L"主人：");
-            if (pos != std::wstring::npos && pos > 0 &&
-                (currentText[pos - 1] == L'\n' || currentText[pos - 1] == L'\r')) {
-                size_t endPos = currentText.find(L"\r\n\r\n茉子：", pos);
-                if (endPos != std::wstring::npos) {
-                    std::wstring userInput = currentText.substr(pos + 3, endPos - pos - 3);
-                    SaveChatHistory(userInput, *fullReply);
+        // 会话序号防串台：只接受等于当前期望序号的收尾，晚到的旧轮回复丢弃。
+        //   历史落盘已在 LLM 线程完成（M4），这里不再重复 SaveChatHistory。
+        StreamDoneMsg* done = (StreamDoneMsg*)lParam;
+        if (done) {
+            if (done->session == g_chatExpectedSession.load()) {
+                int len = GetWindowTextLengthW(g_hHistoryEdit);
+                if (len < 0) len = 0;
+                // ★安全：同 WM_REMOVE_THINKING，按 len+1 分配后再收缩
+                std::wstring currentText((size_t)len + 1, L'\0');
+                GetWindowTextW(g_hHistoryEdit, &currentText[0], len + 1);
+                currentText.resize((size_t)len);
+                size_t thinkPos = currentText.rfind(L"思考中...");
+                if (thinkPos != std::wstring::npos && thinkPos >= 3) {
+                    currentText.erase(thinkPos - 3, currentText.length() - (thinkPos - 3));
+                    currentText += L"（未收到回复）";
+                    SetWindowTextW(g_hHistoryEdit, currentText.c_str());
+                    ApplyChatTheme(hwnd);      // 重设文本会清掉字符格式，这里补回来
                 }
+                g_pendingUserInput.clear();
+                EnsureHistoryBlankLine();   // 这一轮说完，和下一轮之间留一个空行
+                g_isChatting = false;
+                g_typewriting = false;      // 打字机结束，清跳过提示
+                if (IsWindow(g_hSendBtn)) EnableWindow(g_hSendBtn, TRUE);
+                if (IsWindow(g_hInputEdit)) SetFocus(g_hInputEdit);
+            } else {
+                PetDbgW(L"[M4] 丢弃过期会话的收尾消息\n");
             }
-            delete fullReply;
+            delete done;
         }
-        g_isChatting = false;
-        if (IsWindow(g_hSendBtn)) EnableWindow(g_hSendBtn, TRUE);
-        if (IsWindow(g_hInputEdit)) SetFocus(g_hInputEdit);
         break;
     }
     case WM_COMMAND:
-        if (LOWORD(wParam) == 103 && !g_isChatting) {
-            std::vector<wchar_t> buf(512, L'\0');
-            GetWindowTextW(g_hInputEdit, buf.data(), (int)buf.size());
-            if (buf[0] == 0) break;
-            g_isChatting = true;
-            g_stat.chatChars += (int)wcslen(buf.data());   // ★ 累计聊天字数（只统计主人发送）
-            // ★ 好感度不再在这里固定 +1：改由模型回复里的 affection 字段决定，
-            //   在收到回复后通过 WM_APP_AFFINITY 结算（见 LLMThreadProc）
-            AchCheck();
-            EnableWindow(g_hSendBtn, FALSE);
-            SetWindowTextW(g_hInputEdit, L"");
-            // ★ 原写法 std::wstring currentText(len) 后要求 Win32 写入 len+1 个 wchar_t，
-            //   最后一个 '\0' 落在缓冲区外 —— 属于越界写，会破坏堆。改用显式 len+1 的缓冲。
-            int len = GetWindowTextLengthW(g_hHistoryEdit);
-            std::vector<wchar_t> histBuf((size_t)len + 1, L'\0');
-            GetWindowTextW(g_hHistoryEdit, histBuf.data(), len + 1);
-            std::wstring currentText(histBuf.data());
-            std::wstring userText(buf.data());          // vector 不能隐式转 wstring，必须取 .data()
-            currentText += L"主人：" + userText + L"\r\n\r\n茉子：思考中...";
-            SetWindowTextW(g_hHistoryEdit, currentText.c_str());
-            SendMessageW(g_hHistoryEdit, EM_LINESCROLL, 0, 10000);
-            LLMThreadParam* param = new LLMThreadParam();
-            param->hwnd = hwnd; param->input = userText;
-            _beginthreadex(nullptr, 0, LLMThreadProc, param, 0, nullptr);
+        if (LOWORD(wParam) == 103) {
+            // 共用提交入口：按钮和回车都走 SubmitChat。
+            //   按钮被禁用（正在回复）时 Enter 也不能发，故 !g_isChatting 判断放这里。
+            if (!g_isChatting) SubmitChat(hwnd);
         }
         else if (LOWORD(wParam) == 104) {
             SendMessageW(hwnd, WM_CLOSE, 0, 0);
         }
+        else if (LOWORD(wParam) == ID_BTN_ATTACH) {
+            // 📎 文件对话框（多选）
+            PickAttachmentFiles(hwnd);
+        }
+        else if (LOWORD(wParam) == ID_BTN_MIC) {
+            // 🎤 语音输入：开始/结束录音 → whisper 转写 → 填入输入框
+            ToggleVoiceRecord(hwnd);
+        }
+        else if (LOWORD(wParam) == ID_BTN_CLEAR) {
+            // ★危险操作二次确认：第一次点击只上膛（按钮变"⚠ 确认清空？"），
+            //   5 秒内再点一次才真正删除 chat_history.txt。
+            if (g_confirmAction == 1 && GetTickCount64() <= g_confirmUntil) {
+                g_confirmAction = 0;
+                SetButtonText(hwnd, ID_BTN_CLEAR, L"🗑 清空对话");
+                if (g_hStatusLabel && IsWindow(g_hStatusLabel))
+                    SetWindowTextW(g_hStatusLabel, L"");
+                ClearChatHistory();
+                ToastShow(L"🗑", L"对话已清空", L"chat_history.txt 已删除，可以从头开始聊了。");
+            } else {
+                ArmDangerousAction(hwnd, 1);
+            }
+        }
+        else if (LOWORD(wParam) == ID_BTN_MEMORY) {
+            // ★记忆按钮：常态=打开 memory.txt；若已通过右键菜单上膛"清空记忆"，
+            //   这次点击就是确认删除（同样 5 秒内有效）。
+            if (g_confirmAction == 2 && GetTickCount64() <= g_confirmUntil) {
+                g_confirmAction = 0;
+                SetButtonText(hwnd, ID_BTN_MEMORY, L"🧠 记忆");
+                if (g_hStatusLabel && IsWindow(g_hStatusLabel))
+                    SetWindowTextW(g_hStatusLabel, L"");
+                ClearMemoryFile();
+                ToastShow(L"🧠", L"记忆已清空", L"memory.txt 已删除，茉子不再记得之前的事。");
+            } else {
+                OpenMemoryFile();
+            }
+        }
+        else if (LOWORD(wParam) == ID_BTN_LONGFORM) {
+            // 三态循环：自动(2)→短文(0)→长文(1)→自动(2)，能回到默认"自动"。
+            int v = GetLLMConfigInt(L"LongFormManual", 2, 0, 2);
+            int nv = (v == 2) ? 0 : (v == 0) ? 1 : 2;
+            SetLLMConfigInt(L"LongFormManual", nv, 0, 2);
+            const wchar_t* lbl = (nv == 1) ? L"📜 长文" : (nv == 0) ? L"📄 短文" : L"🔀 自动";
+            SetButtonText(hwnd, ID_BTN_LONGFORM, lbl);
+        }
+        else if (LOWORD(wParam) == ID_BTN_THEME) {
+            // ★主题切换：翻转并写回 [UI] ChatTheme 持久化，立即把新主题应用到全部控件。
+            g_chatTheme = (g_chatTheme == 1) ? 0 : 1;
+            SetUIConfigInt(L"ChatTheme", g_chatTheme, 0, 1);
+            SetButtonText(hwnd, ID_BTN_THEME, g_chatTheme ? L"☀️ 浅色" : L"🌙 深色");
+            ApplyChatTheme(hwnd);       // 内含 EM_SETBKGNDCOLOR + 默认文字色 + 重上色 + 重绘
+            UpdateWindow(hwnd);
+        }
         break;
+    // ★深色主题：聊天窗按钮全部 BS_OWNERDRAW，统一自绘（浅色/深色两套配色）
+    case WM_DRAWITEM: {
+        DRAWITEMSTRUCT* dis = (DRAWITEMSTRUCT*)lParam;
+        if (dis && dis->CtlType == ODT_BUTTON) {
+            DrawChatButton(dis);
+            return TRUE;
+        }
+        break;
+    }
+    // ★「记忆」按钮右键菜单：打开文件 / 清空长期记忆（清空需二次确认）
+    case WM_CONTEXTMENU: {
+        HWND src = (HWND)wParam;
+        // ★📎 右键：打开附件缓存目录 / 查看支持的类型
+        if (src && src == GetDlgItem(hwnd, ID_BTN_ATTACH)) {
+            POINT pt;
+            pt.x = (short)LOWORD(lParam);
+            pt.y = (short)HIWORD(lParam);
+            if (lParam == (LPARAM)-1) {
+                RECT r; GetWindowRect(src, &r);
+                pt.x = r.left; pt.y = r.bottom;
+            }
+            HMENU am = CreatePopupMenu();
+            AppendMenuW(am, MF_STRING, 1, L"📂 打开附件缓存目录");
+            AppendMenuW(am, MF_STRING, 2, L"📄 支持哪些文件？");
+            int acmd = (int)TrackPopupMenu(am, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN,
+                pt.x, pt.y, 0, hwnd, nullptr);
+            DestroyMenu(am);
+            if (acmd == 1) OpenAttachCacheDir();
+            else if (acmd == 2) ChatSetStatus(hwnd,
+                L"支持：图片 png/jpg/bmp/gif/webp ｜ 文本与代码 txt/md/json/csv/py/cpp… ｜ PDF（需 pdftotext.exe）｜ docx ｜ xlsx");
+            return 0;
+        }
+        if (src && src == GetDlgItem(hwnd, ID_BTN_MEMORY)) {
+            POINT pt;
+            pt.x = (short)LOWORD(lParam);
+            pt.y = (short)HIWORD(lParam);
+            if (lParam == (LPARAM)-1) {          // 键盘触发：贴在按钮下方
+                RECT r; GetWindowRect(src, &r);
+                pt.x = r.left; pt.y = r.bottom;
+            }
+            HMENU m = CreatePopupMenu();
+            AppendMenuW(m, MF_STRING, 1, L"📂 打开记忆文件");
+            AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(m, MF_STRING, 2, L"🗑 清空长期记忆…");
+            int cmd = (int)TrackPopupMenu(m, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN,
+                pt.x, pt.y, 0, hwnd, nullptr);
+            DestroyMenu(m);
+            if (cmd == 1) OpenMemoryFile();
+            else if (cmd == 2) ArmDangerousAction(hwnd, 2);
+            return 0;
+        }
+        break;
+    }
     case WM_APP_AFFINITY:
         // 兜底：这条消息由主窗口处理。万一被发到聊天窗口，转发过去而不是丢掉。
         // 必须异步：SendMessageW 会阻塞后台 LLM 线程死等主窗口消息循环
         if (g_hwnd && IsWindow(g_hwnd)) PostMessageW(g_hwnd, WM_APP_AFFINITY, wParam, lParam);
         return 0;
+    // ★深色主题：窗口自身背景（控件之间的空隙）必须自己刷，否则会留一片系统灰白。
+    case WM_ERASEBKGND: {
+        if (g_chatTheme == 1) {
+            HDC hdc = (HDC)wParam;
+            RECT rc; GetClientRect(hwnd, &rc);
+            static HBRUSH s_winBrush = CreateSolidBrush(kChatDarkBg);
+            FillRect(hdc, &rc, s_winBrush);
+            return 1;       // 已擦除
+        }
+        break;              // 浅色：交给系统默认
+    }
+    // 深色主题：STATIC/EDIT 等标准控件走 WM_CTLCOLOR*（RichEdit 不走这里，
+    //   它的背景由 ApplyChatTheme 里的 EM_SETBKGNDCOLOR 负责）。
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORSTATIC: {
+        if (g_chatTheme == 1) {
+            HDC hdc = (HDC)wParam;
+            SetBkColor(hdc, kChatDarkBg);
+            SetTextColor(hdc, kChatDarkFg);
+            static HBRUSH s_darkBrush = CreateSolidBrush(kChatDarkBg);
+            return (LRESULT)s_darkBrush;
+        }
+        return 0;   // 浅色：交给默认处理
+    }
+    // 状态栏动画：正在回复时动态"茉子正在思考…"（循环省略号），打字机时显示跳过提示
+    case WM_TIMER:
+        // ★语音：录音计时 + 到上限自动结束（防误触长录把内存占满）
+        if ((UINT)wParam == ID_TIMER_REC) {
+            if (!g_recActive) { KillTimer(hwnd, ID_TIMER_REC); break; }
+            ULONGLONG el = (GetTickCount64() - g_recStartMs) / 1000;
+            if (el >= (ULONGLONG)g_recLimitSec) { VoiceStopRecording(hwnd, true); break; }
+            static ULONGLONG s_lastShownSec = (ULONGLONG)-1;
+            if (el != s_lastShownSec) {          // 每秒只刷一次，避免 200ms 一次的重绘抖动
+                s_lastShownSec = el;
+                ChatSetStatus(hwnd, L"🔴 录音中 " + std::to_wstring(el) + L" 秒 / 最长 "
+                    + std::to_wstring(g_recLimitSec) + L" 秒（再点 🎤 结束）");
+            }
+            break;
+        }
+        if ((UINT)wParam == ID_TIMER_STATUS) {
+            // ★常驻 whisper 的空闲回收：默认 10 分钟没用就关掉，别白占几百 MB 内存。
+            //   每 30 秒才读一次 ini，避免每帧都碰磁盘。
+            {
+                static ULONGLONG s_lastAsrIdleCheck = 0;
+                ULONGLONG now = GetTickCount64();
+                if (g_asrSrvProc && now - s_lastAsrIdleCheck > 30000) {
+                    s_lastAsrIdleCheck = now;
+                    int idleSec = GetIniInt(L"ASR", L"ServerIdleSec", 600, 60, 86400);
+                    if (g_asrSrvLastUse != 0 && now - g_asrSrvLastUse > (ULONGLONG)idleSec * 1000)
+                        AsrServerStop();
+                }
+            }
+            // ★危险操作确认态超时：按钮文字还原，避免"⚠ 确认清空？"长期挂着被误点
+            if (g_confirmAction != 0 && GetTickCount64() > g_confirmUntil) {
+                if (g_confirmAction == 1) SetButtonText(hwnd, ID_BTN_CLEAR, L"🗑 清空对话");
+                else if (g_confirmAction == 2) SetButtonText(hwnd, ID_BTN_MEMORY, L"🧠 记忆");
+                g_confirmAction = 0;
+                if (g_hStatusLabel && IsWindow(g_hStatusLabel))
+                    SetWindowTextW(g_hStatusLabel, L"");
+            }
+            if (g_isChatting && g_hStatusLabel && IsWindow(g_hStatusLabel)) {
+                static int s_dots = 0;
+                s_dots = (s_dots + 1) % 4;
+                std::wstring s = L"茉子正在思考" + std::wstring((size_t)s_dots, L'.');
+                if (g_typewriting && GetUIConfigInt(L"TypewriterSkipMode", 1, 0, 2) != 0)
+                    s += L"（点击聊天窗任意处立即显示全文）";
+                SetWindowTextW(g_hStatusLabel, s.c_str());
+            }
+        }
+        break;
+    // ★附件入口①：把图片/文件直接拖进聊天窗（含子控件区域，由系统沿父链派发）
+    case WM_DROPFILES: {
+        HDROP hd = (HDROP)wParam;
+        UINT n = DragQueryFileW(hd, 0xFFFFFFFF, nullptr, 0);
+        std::wstring firstErr;
+        int added = 0;
+        for (UINT i = 0; i < n; ++i) {
+            wchar_t path[MAX_PATH * 2] = { 0 };
+            if (!DragQueryFileW(hd, i, path, MAX_PATH * 2)) continue;
+            std::wstring err;
+            if (AddAttachmentFromPath(path, err)) ++added;
+            else if (firstErr.empty()) firstErr = err;
+        }
+        DragFinish(hd);
+        RefreshAttachStrip();
+        if (!firstErr.empty())      ChatSetStatus(hwnd, L"⚠ " + firstErr);
+        else if (added > 0)         ChatSetStatus(hwnd, L"已添加 " + std::to_wstring(added)
+                                        + L" 个附件，按 Enter 发送");
+        return 0;
+    }
+    // ★语音转写结果：填进输入框让玩家确认，绝不自动发送（识别错一个字就发出去最坑）
+    case WM_APP_ASR_DONE: {
+        std::wstring* text = (std::wstring*)lParam;
+        if (text) {
+            if (!text->empty() && g_hInputEdit && IsWindow(g_hInputEdit)) {
+                int len = GetWindowTextLengthW(g_hInputEdit);
+                std::wstring cur((size_t)len + 1, L'\0');
+                GetWindowTextW(g_hInputEdit, &cur[0], len + 1);
+                cur.resize((size_t)len);
+                if (!cur.empty()) cur += L" ";
+                cur += *text;
+                SetWindowTextW(g_hInputEdit, cur.c_str());
+                SendMessageW(g_hInputEdit, EM_SETSEL, (WPARAM)cur.size(), (LPARAM)cur.size());
+                SetFocus(g_hInputEdit);
+                ChatSetStatus(hwnd, L"语音已转成文字，确认无误后按 Enter 发送");
+            } else {
+                ChatSetStatus(hwnd, L"没听清，靠近麦克风再说一次？");
+            }
+            delete text;
+        }
+        return 0;
+    }
     case WM_CLOSE:
-        g_hChatWnd = nullptr; g_isChatting = false;
+        KillTimer(hwnd, ID_TIMER_STATUS);
         DestroyWindow(hwnd); break;
     case WM_DESTROY:
-        g_hChatWnd = nullptr; g_isChatting = false;
+        // ★ 窗口销毁后子控件句柄全部失效：必须一并置空；
+        //   否则触摸追加 / 聊天写入会访问已销毁的 g_hHistoryEdit（悬空句柄）。
+        g_hChatWnd = nullptr;
+        g_hHistoryEdit = nullptr;
+        g_hInputEdit = nullptr;
+        g_hSendBtn = nullptr;
+        g_isChatting = false;
+        g_typewriting = false;
+        g_typewriterSkip.store(false);
+        // ★附件：关窗即丢弃待发送队列，并释放缩略图 GDI+ 对象
+        g_hAttachStrip = nullptr;
+        ClearAttachThumbs();
+        g_pendingAttachments.clear();
+        g_oldInputProc = nullptr;   // 旧窗口的子类化信息已失效，下次重建要重新挂
+        VoiceAbortRecording();      // 正在录音就立刻停掉，别让 waveIn 回调摸到已销毁窗口
+        if (g_hStatusLabel) { g_hStatusLabel = nullptr; }
         break;
     default: return DefWindowProcW(hwnd, msg, wParam, lParam);
     }
     return 0;
+}
+
+// ==================================================================
+//  ★ 聊天窗辅助函数（U2 提交 / U6 清空·记忆·长短文 / U3 跳过提示）
+// ==================================================================
+
+// 写回 llm.ini 的数值配置（聊天窗"长文/短文"开关用）
+static void SetLLMConfigInt(const wchar_t* key, int val, int lo, int hi) {
+    if (val < lo) val = lo;
+    if (val > hi) val = hi;
+    std::wstring exeDir;
+    if (!GetExeDir(exeDir)) return;
+    std::wstring iniPath = exeDir + L"\\llm.ini";
+    wchar_t buf[16];
+    wsprintfW(buf, L"%d", val);
+    WritePrivateProfileStringW(L"LLM", key, buf, iniPath.c_str());
+}
+
+// 写回 llm.ini 的 [UI] 段（主题/打字机开关等偏好持久化）
+static void SetUIConfigInt(const wchar_t* key, int val, int lo, int hi) {
+    if (val < lo) val = lo;
+    if (val > hi) val = hi;
+    std::wstring exeDir;
+    if (!GetExeDir(exeDir)) return;
+    std::wstring iniPath = exeDir + L"\\llm.ini";
+    wchar_t buf[16];
+    wsprintfW(buf, L"%d", val);
+    WritePrivateProfileStringW(L"UI", key, buf, iniPath.c_str());
+}
+
+static void SetButtonText(HWND hwnd, int id, const wchar_t* text) {
+    HWND b = GetDlgItem(hwnd, id);
+    if (!b) return;
+    SetWindowTextW(b, text);
+    InvalidateRect(b, nullptr, TRUE);   // 自绘按钮需显式重绘才立刻换字
+}
+
+// 触摸气泡：把整段回复截成 1-2 句放进贴角色轻气泡。
+//   先按标点（。！？～.!?）切到第 2 个断点，再按 60 字硬顶，保证气泡不刷屏。
+static std::wstring TruncateReply(const std::wstring& s) {
+    if (s.empty()) return L"";
+    // 先把换行/回车换成空格（气泡里不显示换行），再按标点切到
+    //   第 2 个断点；若整段没到 2 个断点，则用 60 字硬顶兜底。
+    std::wstring flat;
+    flat.reserve(s.size());
+    for (wchar_t c : s)
+        flat += (c == L'\r' || c == L'\n') ? L' ' : c;
+
+    const wchar_t* stops = L"。！？～.!?";
+    size_t cut = std::wstring::npos;
+    int dots = 0;
+    for (size_t i = 0; i < flat.size(); ++i) {
+        if (wcschr(stops, flat[i])) {
+            ++dots;
+            if (dots >= 2) { cut = i + 1; break; }   // 含断点标点本身
+        }
+    }
+    // 没凑够 2 句：按 60 字硬顶；凑够了但那句特别长也仍受 60 字限制。
+    const size_t hardMax = 60;
+    size_t end = (cut == std::wstring::npos) ? flat.size() : cut;
+    if (end > hardMax) end = hardMax;
+    std::wstring r = flat.substr(0, end);
+    // 硬顶截断且后面还有内容时补省略号，气泡里一眼看出"还有下文"
+    if (end < flat.size() && r.size() >= hardMax) {
+        if (r.size() > hardMax - 1) r.resize(hardMax - 1);
+        r += L"…";
+    }
+    return r;
+}
+
+// 打字机跳过提示：打字时在状态栏/输入框旁显示"点击跳过"小字。
+//   TypewriterSkipMode=0 时不提示（跳过已禁用）。
+static void ShowTypewriterSkipHint() {
+    if (g_hStatusLabel && IsWindow(g_hStatusLabel) &&
+        GetUIConfigInt(L"TypewriterSkipMode", 1, 0, 2) != 0)
+        SetWindowTextW(g_hStatusLabel, L"（正在显示中… 点击聊天窗任意处立即显示全文）");
+}
+
+// ★危险操作"上膛"：按钮切到确认态 + 状态栏说明，5 秒内再点一次才真删。
+//   记忆 / 对话记录都是不可恢复数据，误点一下全丢代价太大。
+static void ArmDangerousAction(HWND hwnd, int action) {
+    g_confirmAction = action;
+    g_confirmUntil = GetTickCount64() + CONFIRM_WINDOW_MS;
+    if (action == 1) {
+        // 按钮只有 96px 宽，确认态用短文案，具体删什么写在状态栏
+        if (hwnd) SetButtonText(hwnd, ID_BTN_CLEAR, L"⚠ 确认？");
+        if (g_hStatusLabel && IsWindow(g_hStatusLabel))
+            SetWindowTextW(g_hStatusLabel,
+                L"⚠ 再点一次「清空对话」按钮将永久删除全部对话记录（5 秒内有效，超时自动取消）");
+    } else if (action == 2) {
+        if (hwnd) SetButtonText(hwnd, ID_BTN_MEMORY, L"⚠ 确认？");
+        if (g_hStatusLabel && IsWindow(g_hStatusLabel))
+            SetWindowTextW(g_hStatusLabel,
+                L"⚠ 再点一次「记忆」按钮将永久删除 memory.txt（5 秒内有效，超时自动取消）");
+    }
+}
+
+// 清空对话：清 chat_history 文件并刷新窗口
+//   注意：调用方必须先经 ArmDangerousAction 二次确认，本函数不再自行询问。
+static void ClearChatHistory() {
+    std::wstring exeDir;
+    if (GetExeDir(exeDir)) {
+        std::wstring p = exeDir + L"\\chat_history.txt";
+        {
+            std::lock_guard<std::recursive_mutex> lk(g_historyFileMtx);
+            _wremove(p.c_str());
+        }
+    }
+    if (g_hHistoryEdit && IsWindow(g_hHistoryEdit)) {
+        SetWindowTextW(g_hHistoryEdit, L"（对话已清空，开始新的对话吧~）\r\n\r\n");
+        SendMessageW(g_hHistoryEdit, EM_LINESCROLL, 0, 10000);
+        ApplyChatTheme(g_hChatWnd);      // 占位文字也要跟着主题上色
+    }
+    g_pendingUserInput.clear();
+    g_streamCr = false; g_nlRun = 0;
+}
+
+// ★危险操作：清空长期记忆（memory.txt）。调用前必须二次确认。
+static void ClearMemoryFile() {
+    std::wstring exeDir;
+    if (GetExeDir(exeDir)) {
+        std::wstring p = exeDir + L"\\memory.txt";
+        std::lock_guard<std::recursive_mutex> lk(g_historyFileMtx);
+        _wremove(p.c_str());
+    }
+    InvalidateMemoryCache();     // 内部已清 g_memoryCache 并置 loaded=false
+}
+
+// 记忆：用系统默认程序打开 memory.txt
+static void OpenMemoryFile() {
+    // 缓存失效：用户点"记忆"按钮查看/编辑 memory.txt，关闭后下一轮对话
+    //   必须读到改过的内容——打开前就把缓存作废，下次 BuildMemoryContext 重新读盘。
+    InvalidateMemoryCache();
+    std::wstring exeDir;
+    if (!GetExeDir(exeDir)) return;
+    std::wstring p = exeDir + L"\\memory.txt";
+    if (!PathFileExistsW(p.c_str()))
+        ShellExecuteW(nullptr, L"open", L"notepad.exe", L"", nullptr, SW_SHOWNORMAL);
+    else
+        ShellExecuteW(nullptr, L"open", p.c_str(), L"", nullptr, SW_SHOWNORMAL);
+}
+
+// ==================================================================
+//  输入框键盘：RichEdit 自带 WndProc，按键发给它自身而非父窗口。
+//  这里子类化 g_hInputEdit，截获 WM_KEYDOWN：
+//    Enter        -> 提交（等价于点"发送"）
+//    Shift+Enter -> 换行（交给 RichEdit 默认处理）
+//    Esc          -> 关闭聊天窗
+// ==================================================================
+
+static LRESULT CALLBACK InputSubclassProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_KEYDOWN && h == g_hInputEdit) {
+        UINT vk = (UINT)wp;
+        bool shiftDown = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+        if (vk == VK_RETURN && !shiftDown && !g_isChatting) {
+            // Enter（无 Shift）：提交。需要父窗口句柄投递 WM_COMMAND。
+            HWND owner = GetParent(h);
+            if (owner) SendMessageW(owner, WM_COMMAND, MAKELPARAM(103, BN_CLICKED), 0);
+            return 0;
+        }
+        if (vk == VK_ESCAPE) {
+            HWND owner = GetParent(h);
+            if (owner) SendMessageW(owner, WM_CLOSE, 0, 0);
+            return 0;
+        }
+        // ★附件入口②：Ctrl+V 粘贴。剪贴板里是文件（资源管理器复制）或纯位图（截图工具）
+        //   时做成附件；同时带文字时优先按普通文本粘贴，避免抢掉用户的文字。
+        if (vk == 'V' && (GetKeyState(VK_CONTROL) & 0x8000)) {
+            bool hasFiles = IsClipboardFormatAvailable(CF_HDROP) != FALSE;
+            bool hasDib   = IsClipboardFormatAvailable(CF_DIB) != FALSE;
+            bool hasText  = IsClipboardFormatAvailable(CF_UNICODETEXT) != FALSE;
+            if (hasFiles || (hasDib && !hasText)) {
+                HWND owner = GetParent(h);
+                if (owner) {
+                    std::wstring err;
+                    if (!AttachFromClipboard(owner, err) && !err.empty())
+                        ChatSetStatus(owner, L"⚠ " + err);
+                }
+                return 0;
+            }
+        }
+        // Shift+Enter 及所有其它键：交给原 RichEdit 默认处理（Enter 换行）
+    }
+    if (g_oldInputProc)
+        return CallWindowProcW(g_oldInputProc, h, msg, wp, lp);
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+// 共用提交入口：按钮(103) 和 回车(WM_KEYDOWN) 都走这里
+static void SubmitChat(HWND hwnd) {
+    if (g_isChatting || !g_hInputEdit) return;
+    // 按控件实际长度分配（上限 64KB）：固定缓冲会静默截断长消息。
+    int need = GetWindowTextLengthW(g_hInputEdit);
+    if (need < 0) need = 0;
+    if (need > 64 * 1024) need = 64 * 1024;
+    std::vector<wchar_t> buf((size_t)need + 1, L'\0');
+    GetWindowTextW(g_hInputEdit, buf.data(), (int)buf.size());
+    buf[buf.size() - 1] = L'\0';
+    // 只有附件、没有文字也允许发送（"你看这是什么"的意图由缺省话术补足）
+    if (buf[0] == 0 && g_pendingAttachments.empty()) return;
+    g_isChatting = true;
+    g_lastUserInputMs = GetTickCount64();          // 重置主动搭话静默计时，别打断用户
+    g_stat.chatChars += (int)wcslen(buf.data());   // ★ 累计聊天字数（只统计主人发送）
+    // ★ 好感度由模型回复里的 affection 字段决定（WM_APP_AFFINITY 结算）
+    AchCheck();
+    if (g_hSendBtn) EnableWindow(g_hSendBtn, FALSE);
+    SetWindowTextW(g_hInputEdit, L"");
+    std::wstring userText(buf.data());
+    if (userText.empty()) userText = L"看看这个～";
+    std::wstring attachTag = BuildAttachmentHistoryTag(g_pendingAttachments);
+    g_streamCr = false; g_nlRun = 0;
+    TtsStopAll();                                   // 新一轮开始：掐掉上一轮语音
+    g_pendingUserInput = attachTag + userText;      // 回复到达时配对（M4 起落盘在线程内）
+    AppendChatView(L"主人：" + attachTag + userText + L"\r\n\r\n茉子：思考中...");
+    // 开启新会话：递增全局序号并设为期望序号
+    int seq = ++g_chatSessionSeq;
+    g_chatExpectedSession = seq;
+    LLMThreadParam* param = new LLMThreadParam();
+    param->hwnd = hwnd; param->input = userText; param->session = seq;
+    // ★附件：队列拷给线程（线程只读），主线程立刻清空，附件不会重复发送
+    param->attachments = g_pendingAttachments;
+    param->historyTag = attachTag;
+    CacheAttachmentFiles(param->attachments);   // 图片留一份到 attach_cache\ 供回看
+    g_pendingAttachments.clear();
+    ClearAttachThumbs();
+    g_attachHover = -1;
+    if (g_hAttachStrip && IsWindow(g_hAttachStrip)) ShowWindow(g_hAttachStrip, SW_HIDE);
+    LayoutChatChildren(hwnd);
+    g_typewriting = true;
+    ShowTypewriterSkipHint();
+    // 线程创建失败时必须复位所有"进行中"标志。
+    //   忽略返回值时，一旦 _beginthreadex 失败（句柄/内存耗尽），
+    //   g_isChatting 永远停在 true，输入框和发送键从此禁用，表现为"聊天卡死"。
+    if (!_beginthreadex(nullptr, 0, LLMThreadProc, param, 0, nullptr)) {
+        delete param;
+        g_isChatting = false;
+        g_typewriting = false;
+        g_pendingUserInput.clear();
+        if (g_hSendBtn) EnableWindow(g_hSendBtn, TRUE);
+        AppendChatView(L"（系统）启动回复线程失败，请重新发送。");
+        ChatSetStatus(hwnd, L"⚠ 启动回复线程失败，请重试");
+    }
+}
+
+// ==================================================================
+// 聊天窗位置/大小记忆：复用 config.ini 的 [Chat] 段，记住上次
+//   位置、尺寸，以及"上次是否开着"（可选）。缺省时回落到主窗居中。
+// ==================================================================
+static void SaveChatWindowRect() {
+    if (!g_hChatWnd || !IsWindow(g_hChatWnd)) return;
+    std::wstring ini;
+    if (!ConfigIniPath(ini)) return;
+    RECT rc;
+    if (!GetWindowRect(g_hChatWnd, &rc)) return;
+    wchar_t buf[32];
+    wsprintfW(buf, L"%d", rc.left);  WritePrivateProfileStringW(L"Chat", L"X", buf, ini.c_str());
+    wsprintfW(buf, L"%d", rc.top);   WritePrivateProfileStringW(L"Chat", L"Y", buf, ini.c_str());
+    wsprintfW(buf, L"%d", rc.right - rc.left); WritePrivateProfileStringW(L"Chat", L"W", buf, ini.c_str());
+    wsprintfW(buf, L"%d", rc.bottom - rc.top); WritePrivateProfileStringW(L"Chat", L"H", buf, ini.c_str());
 }
 
 static void OpenChatDialog() {
@@ -3652,13 +9422,50 @@ static void OpenChatDialog() {
     wc.lpszClassName = L"MakotoChatWndClass"; wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW); wc.cbSize = sizeof(WNDCLASSEXW);
     RegisterClassExW(&wc);
-    RECT ownerRect; GetWinRect(g_hwnd, ownerRect);
-    int x = ownerRect.left + (ownerRect.right - ownerRect.left) / 2 - 240;
-    int y = ownerRect.top + (ownerRect.bottom - ownerRect.top) / 2 - 260;
+    // 优先用上次记住的位置/尺寸，缺省再按主窗居中
+    int x = 0, y = 0, w = 490, h = 520;
+    bool restored = false;
+    {
+        std::wstring ini;
+        if (ConfigIniPath(ini)) {
+            wchar_t b[32];
+            GetPrivateProfileStringW(L"Chat", L"X", L"", b, 32, ini.c_str());
+            int rx = _wtoi(b);
+            GetPrivateProfileStringW(L"Chat", L"Y", L"", b, 32, ini.c_str());
+            int ry = _wtoi(b);
+            GetPrivateProfileStringW(L"Chat", L"W", L"", b, 32, ini.c_str());
+            int rw = _wtoi(b);
+            GetPrivateProfileStringW(L"Chat", L"H", L"", b, 32, ini.c_str());
+            int rh = _wtoi(b);
+            if (rw >= 400) w = rw;
+            if (rh >= 430) h = rh;      // 附件条出现后 350 太矮，低于 430 用默认高度
+            bool posOk = (rx < 0 || ry < 0 || rx > 0 || ry > 0);
+            if (posOk && (rw > 0 || rh > 0)) { x = rx; y = ry; restored = true; }
+        }
+    }
+    if (!restored) {
+        RECT ownerRect; GetWinRect(g_hwnd, ownerRect);
+        x = ownerRect.left + (ownerRect.right - ownerRect.left) / 2 - w / 2;
+        y = ownerRect.top + (ownerRect.bottom - ownerRect.top) / 2 - h / 2;
+    }
     g_hChatWnd = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
         L"MakotoChatWndClass", L"💬 和茉子聊天",
         WS_POPUPWINDOW | WS_CAPTION | WS_VISIBLE | WS_THICKFRAME | WS_MAXIMIZEBOX,
-        x, y, 490, 520, g_hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+        x, y, w, h, g_hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+}
+
+// 聊天窗位置/尺寸变过（拖完/调完）静默 0.8s 落盘，复用主窗 MarkGeomDirty 思路。
+static ULONGLONG g_chatGeomDirtyMs = 0;
+static bool g_chatGeomDirty = false;
+static void MarkChatGeomDirty() {
+    g_chatGeomDirty = true;
+    g_chatGeomDirtyMs = GetTickCount64();
+}
+static void MaybeSaveChatGeom() {
+    if (!g_chatGeomDirty) return;
+    if (g_chatGeomDirtyMs != 0 && GetTickCount64() - g_chatGeomDirtyMs < 800) return;
+    SaveChatWindowRect();
+    g_chatGeomDirty = false;
 }
 // ================= RVC 翻唱系统 =================
 // ============================================================
@@ -3734,8 +9541,12 @@ static bool WinHttpDownload(HINTERNET hConnect, const wchar_t* path, std::vector
     if (!hReq) return false;
     if (!WinHttpSendRequest(hReq, NULL, 0, NULL, 0, 0, 0)) { WinHttpCloseHandle(hReq); return false; }
     if (!WinHttpReceiveResponse(hReq, NULL)) { WinHttpCloseHandle(hReq); return false; }
+    // ★安全：音频下载设 128MB 上限，分块 8MB，防止异常服务端把内存拖垮
+    const size_t kMaxDownload = 128u * 1024u * 1024u;
     DWORD dwSize = 0, dwDownloaded = 0;
     while (WinHttpQueryDataAvailable(hReq, &dwSize) && dwSize > 0) {
+        if (out.size() >= kMaxDownload) break;
+        if (dwSize > 8u * 1024u * 1024u) dwSize = 8u * 1024u * 1024u;
         std::vector<char> buf(dwSize);
         if (!WinHttpReadData(hReq, buf.data(), dwSize, &dwDownloaded) || dwDownloaded == 0) break;
         out.insert(out.end(), buf.begin(), buf.begin() + dwDownloaded);
@@ -3749,9 +9560,13 @@ static std::string WinHttpGetText(HINTERNET hConnect, const wchar_t* path) {
     if (!hReq) return "";
     if (!WinHttpSendRequest(hReq, NULL, 0, NULL, 0, 0, 0)) { WinHttpCloseHandle(hReq); return ""; }
     if (!WinHttpReceiveResponse(hReq, NULL)) { WinHttpCloseHandle(hReq); return ""; }
+    // ★安全：这里只取 openapi.json / 普通文本，8MB 足够，避免异常响应吃满内存
+    const size_t kMaxText = 8u * 1024u * 1024u;
     std::string resp;
     DWORD dwSize = 0, dwDownloaded = 0;
     while (WinHttpQueryDataAvailable(hReq, &dwSize) && dwSize > 0) {
+        if (resp.size() >= kMaxText) break;
+        if (dwSize > 1024u * 1024u) dwSize = 1024u * 1024u;
         std::vector<char> buf(dwSize);
         if (!WinHttpReadData(hReq, buf.data(), dwSize, &dwDownloaded) || dwDownloaded == 0) break;
         resp.append(buf.data(), dwDownloaded);
@@ -3792,7 +9607,7 @@ static bool ParseWav(const std::vector<char>& wav, WavData& out) {
     if (memcmp(wav.data(), "RIFF", 4) != 0 || memcmp(wav.data() + 8, "WAVE", 4) != 0) return false;
 
     DWORD pos = 12;
-    int byteRate = 0, blockAlign = 0;
+    int blockAlign = 0;
     std::vector<uint8_t> rawPcm;
     while (pos + 8 <= wav.size()) {
         char cid[4]; DWORD cs;
@@ -3800,8 +9615,11 @@ static bool ParseWav(const std::vector<char>& wav, WavData& out) {
         memcpy(&cs, wav.data() + pos + 4, 4);
         if (!memcmp(cid, "fmt ", 4)) {
             WAVEFORMATEX tmp{};
+            // ★安全：同 LoadWavFromMemory，fmt 声明长度不可信，按实际剩余字节裁剪
+            size_t availFmt = wav.size() - ((size_t)pos + 8);
             DWORD tr = (DWORD)min((size_t)cs, sizeof(WAVEFORMATEX));
-            memcpy(&tmp, wav.data() + pos + 8, tr);
+            if ((size_t)tr > availFmt) tr = (DWORD)availFmt;
+            if (tr) memcpy(&tmp, wav.data() + pos + 8, tr);
             out.sampleRate = tmp.nSamplesPerSec;
             out.channels = tmp.nChannels;
             out.bitsPerSample = tmp.wBitsPerSample;
@@ -3833,9 +9651,13 @@ static bool ParseWav(const std::vector<char>& wav, WavData& out) {
     if (rawPcm.size() > (size_t)256 * 1024 * 1024) return false;
 
     int bytesPerSample = out.bitsPerSample / 8;
-    if (blockAlign == 0) blockAlign = bytesPerSample * out.channels;
+    if (bytesPerSample <= 0) return false;
+    // ★安全：blockAlign 来自文件头，可能比"单帧真实字节数"小（畸形/伪造 WAV）。
+    //   若直接当步长，循环会按更小的 stride 走更多帧，最后一帧读样本时越过 rawPcm 末尾。
+    //   这里强制不小于 bytesPerSample*channels，保证读取范围一定落在缓冲区内。
+    int needFrame = bytesPerSample * out.channels;
+    if (blockAlign <= 0 || blockAlign < needFrame) blockAlign = needFrame;
     int frameSize = blockAlign;
-    if (bytesPerSample <= 0 || frameSize <= 0) return false;   // 防止除零
     int numFrames = (int)(rawPcm.size() / frameSize);
     size_t sampleCount = (size_t)numFrames * (size_t)out.channels;
     // samples 是 int32_t：8bit 输入会放大 4 倍，必须按结果数组大小设上限。
@@ -4077,15 +9899,19 @@ static bool RvcConvert(const std::wstring& wavPath, std::vector<char>& outWav) {
     if (!hReq) { WinHttpCloseHandle(hConn); WinHttpCloseHandle(hSess); return false; }
 
     std::wstring ct = L"Content-Type: multipart/form-data; boundary=" + Utf8ToWideString(boundary);
-    WinHttpAddRequestHeaders(hReq, ct.c_str(), -1, WINHTTP_ADDREQ_FLAG_ADD);
+    WinHttpAddRequestHeaders(hReq, ct.c_str(), (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD);
     if (!WinHttpSendRequest(hReq, NULL, 0, (LPVOID)payload.data(), (DWORD)payload.size(), (DWORD)payload.size(), 0)) {
         WinHttpCloseHandle(hReq); WinHttpCloseHandle(hConn); WinHttpCloseHandle(hSess); return false;
     }
     WinHttpReceiveResponse(hReq, NULL);
 
+    // ★安全：RVC 任务状态 JSON，8MB 上限足矣
+    const size_t kMaxRvcJson = 8u * 1024u * 1024u;
     std::string resp;
     DWORD dwSize = 0, dwDownloaded = 0;
     while (WinHttpQueryDataAvailable(hReq, &dwSize) && dwSize > 0) {
+        if (resp.size() >= kMaxRvcJson) break;
+        if (dwSize > 1024u * 1024u) dwSize = 1024u * 1024u;
         std::vector<char> buf(dwSize);
         if (!WinHttpReadData(hReq, buf.data(), dwSize, &dwDownloaded) || dwDownloaded == 0) break;
         resp.append(buf.data(), dwDownloaded);
@@ -4271,21 +10097,6 @@ static void RvcPickAndConvert(HWND owner) {
     g_hRvcThread = hThread;
 }
 
-// 对外接口②：直接对指定路径做翻唱（供扩展/调试用，菜单不再暴露）
-static void RvcPerform(const std::wstring& srcWav) {
-    if (g_rvcBusy) return;
-    g_rvcBusy = true;
-    std::wstring* arg = new std::wstring(srcWav);
-    HANDLE hThread = (HANDLE)_beginthreadex(nullptr, 0, RvcWorker, arg, 0, nullptr);
-    if (!hThread) {
-        delete arg;
-        g_rvcBusy.store(false);
-        RvcSetStage(RvcStage::Failed);
-        return;
-    }
-    if (g_hRvcThread) CloseHandle(g_hRvcThread);
-    g_hRvcThread = hThread;
-}
 
 // ================= 右键菜单 =================
 void ShowContextMenu(HWND hwnd) {
@@ -4299,9 +10110,13 @@ void ShowContextMenu(HWND hwnd) {
     POINT pt; GetCursorPos(&pt);
     HMENU menu = CreatePopupMenu();
     HMENU outfits = CreatePopupMenu();
+    HMENU renderMenu = CreatePopupMenu();
     HMENU volumeMenu = CreatePopupMenu();
     HMENU bgmMenu = CreatePopupMenu();
     HMENU octMenu = CreatePopupMenu();
+    // ★ 每次弹菜单都重扫一遍素材：用户可能刚把 Animations 或 live2d 拷进来，
+    //   不必重开程序就能看到新选项。只查存在性，开销可以忽略。
+    DetectAssets();
 
     // ★ 养成总览：放在菜单最上面，随时能看到进度
     wchar_t headLine[64];
@@ -4336,6 +10151,7 @@ void ShowContextMenu(HWND hwnd) {
     };
 
     AppendMenuW(menu, MF_STRING, ID_CHAT, L"💬 对话");
+    AppendMenuW(menu, MF_STRING, ID_SETTINGS, L"⚙ 设置");
     AppendMenuW(menu, MF_STRING, ID_TRAY_SHOW, IsWindowVisible(hwnd) ? L"隐藏桌宠" : L"显示桌宠");
     AppendMenuW(menu, MF_STRING | (IsAutoStartEnabled() ? MF_CHECKED : MF_UNCHECKED)
         | (UnlockReady(UNLOCK_AUTOSTART) ? 0 : MF_DISABLED | MF_GRAYED),
@@ -4355,11 +10171,49 @@ void ShowContextMenu(HWND hwnd) {
         4, lockName(UNLOCK_COSTUME_DRESS, L"礼服").c_str());
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
 
+    // ---- 渲染方式：序列帧 / Live2D ----
+    // 装了哪套就放开哪一项；缺素材的那项灰掉并写明缺什么，从菜单层面就不给切。
+    {
+        wchar_t rTitle[64];
+        // 标题写"实际正在用的"：某套服装没模型被自动降级时，这一行会如实变成"序列帧"
+        swprintf(rTitle, 64, L"🖼 渲染方式（%s）", Live2DReady() ? L"Live2D" : L"序列帧");
+        AppendMenuW(menu, MF_STRING | MF_POPUP, (UINT_PTR)renderMenu, rTitle);
+
+        std::wstring frameItem = g_hasFrameAssets
+            ? L"序列帧（Animations）"
+            : L"序列帧（未找到 Animations 素材）";
+        AppendMenuW(renderMenu, MF_STRING
+            | (!Live2DReady() ? MF_CHECKED : 0)
+            | (g_hasFrameAssets ? 0 : MF_DISABLED | MF_GRAYED),
+            ID_RENDER_FRAMES, frameItem.c_str());
+
+#if USE_LIVE2D
+        std::wstring l2dItem = g_hasLive2DAssets
+            ? L"Live2D（模型渲染）"
+            : L"Live2D（未找到模型或 p2l_runtime.dll）";
+#else
+        std::wstring l2dItem = L"Live2D（本版本未编译）";
+#endif
+        AppendMenuW(renderMenu, MF_STRING
+            | (Live2DReady() ? MF_CHECKED : 0)
+            | (g_hasLive2DAssets ? 0 : MF_DISABLED | MF_GRAYED),
+            ID_RENDER_LIVE2D, l2dItem.c_str());
+    }
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+
     AppendMenuW(menu, MF_STRING | MF_POPUP, (UINT_PTR)volumeMenu, L"音量");
     AppendMenuW(volumeMenu, MF_STRING | (g_currentVolume == 0 ? MF_CHECKED : 0), ID_VOLUME_MUTE, L"静音");
     AppendMenuW(volumeMenu, MF_STRING | (g_currentVolume == 300 ? MF_CHECKED : 0), ID_VOLUME_LOW, L"低");
     AppendMenuW(volumeMenu, MF_STRING | (g_currentVolume == 700 ? MF_CHECKED : 0), ID_VOLUME_MID, L"中");
     AppendMenuW(volumeMenu, MF_STRING | (g_currentVolume == 1000 ? MF_CHECKED : 0), ID_VOLUME_HIGH, L"高");
+
+    // ★ 语音朗读开关：关掉只是不播语音，LLM/表情/动作照常，
+    //   想安静看字的时候不用把 GPT-SoVITS 服务关掉。
+    {
+        bool on = g_ttsVoiceOn.load();
+        AppendMenuW(menu, MF_STRING | (on ? MF_CHECKED : 0), ID_TTS_TOGGLE,
+            on ? L"🔊 语音朗读（开）" : L"🔇 语音朗读（关）");
+    }
 
     bool bgmOk = UnlockReady(UNLOCK_BGM);
     AppendMenuW(menu, MF_STRING | MF_POPUP | (bgmOk ? 0 : MF_DISABLED | MF_GRAYED),
@@ -4417,8 +10271,25 @@ void ShowContextMenu(HWND hwnd) {
     case ID_VOLUME_MID: g_currentVolume = 700; SetBGMVolume(700); SyncAllSFXVolume(); break;
     case ID_VOLUME_HIGH: g_currentVolume = 1000; SetBGMVolume(1000); SyncAllSFXVolume(); break;
     case ID_CHAT: OpenChatDialog(); break;
+    case ID_SETTINGS: OpenSettingsDialog(); break;
     case ID_ACH_PANEL: OpenAchPanel(); break;
     case ID_TRAY_EXIT: DestroyWindow(hwnd); break;
+    // 🖼 渲染方式切换：素材缺失的项已经被灰掉，这里再兜一层，避免快捷键绕进来
+    case ID_RENDER_FRAMES: SetRenderMode(RM_FRAMES); break;
+    case ID_RENDER_LIVE2D: SetRenderMode(RM_LIVE2D); break;
+    case ID_TTS_TOGGLE: {
+        bool on = !g_ttsVoiceOn.load();
+        g_ttsVoiceOn.store(on);
+        if (!on) TtsStopAll();          // 关掉时正在念的那句也立刻停
+        wchar_t b[8]; wsprintfW(b, L"%d", on ? 1 : 0);
+        wchar_t ini[MAX_PATH]; GetModuleFileNameW(nullptr, ini, MAX_PATH); PathRemoveFileSpecW(ini);
+        wcscat_s(ini, L"\\llm.ini");
+        WritePrivateProfileStringW(L"TTS", L"TtsEnable", b, ini);
+        ToastShow(on ? L"🔊" : L"🔇", on ? L"语音朗读已开启" : L"语音朗读已关闭",
+                  on ? L"回复会自动念出来。"
+                     : L"只显示文字。想再打开：右键 → 语音朗读。");
+        break;
+    }
     case ID_RVC_PICK:   // 🎤 弹出文件框选歌翻唱
         if (guardUnlock(UNLOCK_RVC)) RvcPickAndConvert(hwnd);
         break;
@@ -4437,6 +10308,157 @@ void ShowContextMenu(HWND hwnd) {
     }
 }
 
+// ==================================================================
+//  ★触摸互动（LLM 驱动）：八部位触摸 -> 把"主人摸了某部位"讲给 LLM，
+//  由模型自己决定表情/台词/动作/视线；好感仍本地即时结算，养成节奏不受网络影响。
+//  - 点击瞬间：好感 + 音效 + 动作 + "……"占位气泡（马上有反馈）
+//  - LLM 返回：气泡显示模型反应（含（动作描写）+台词），导演指令同步表情/动作/视线
+//  - 关闭 TouchLlmEnable / 网络失败 / 冷却中：退回本地固定反应（离线可用）
+// ==================================================================
+#if USE_LIVE2D
+// 本地降级反馈：不依赖 LLM，按部位给一套固定反应（旧行为保留）。
+static void DoBodyTouchLocalFallback(L2dBodyPart part, bool egg, int gain) {
+    int  slot = L2D_IDLE;
+    PetEmotion emo = PetEmotion::Base;
+    int  gaze = -1;
+    const wchar_t* icon = L"♥";
+    const wchar_t* title = L" touching";
+    wchar_t bubble[96] = { 0 };
+
+    if (part == L2D_PART_HEAD) {
+        slot = L2D_THINK; emo = egg ? PetEmotion::Smile : PetEmotion::ShyBlush; gaze = L2D_GAZE_DOWN;
+        icon = L"♥"; title = egg ? L"害羞了" : L"摸摸头";
+        swprintf(bubble, 96, egg ? L"唉，别一直摸了啦……（好感 +%d）"
+                                 : L"唔……摸摸头吗？（好感 +%d）", gain);
+    } else if (part == L2D_PART_FACE) {
+        slot = L2D_PEACE; emo = PetEmotion::ShyBlush; gaze = L2D_GAZE_AWAY;
+        icon = L"💕"; title = L"戳戳脸";
+        swprintf(bubble, 96, L"呜…！别戳脸啦，会、会害羞的！（好感 +%d）", gain);
+    } else if (part == L2D_PART_HAND) {
+        slot = L2D_PEACE; emo = PetEmotion::ShyBlush; gaze = L2D_GAZE_DOWN;   // 牵手的反应是害羞，不是开心
+        icon = L"💗"; title = L"牵牵手";
+        swprintf(bubble, 96, L"牵、牵手？笨、笨蛋……（好感 +%d）", gain);
+    } else if (part == L2D_PART_CHEST) {
+        slot = L2D_PEACE; emo = PetEmotion::ShyBlush; gaze = L2D_GAZE_DOWN;
+        icon = L"💗"; title = L"碰到了";
+        swprintf(bubble, 96, L"呀！那、那里……别乱碰！（好感 +%d）", gain);
+    } else if (part == L2D_PART_BELLY) {
+        slot = L2D_THINK; emo = PetEmotion::Panic; gaze = L2D_GAZE_DOWN;
+        icon = L"✿"; title = L"揉揉肚子";
+        swprintf(bubble, 96, L"噗……别挠，痒、痒！（好感 +%d）", gain);
+    } else if (part == L2D_PART_SKIRT) {
+        slot = L2D_PEACE; emo = PetEmotion::ShyBlush; gaze = L2D_GAZE_DOWN;
+        icon = L"✿"; title = L"扯裙子";
+        swprintf(bubble, 96, L"呀！别、别扯裙子啦……（好感 +%d）", gain);
+    } else if (part == L2D_PART_LEG) {
+        slot = L2D_THINK; emo = PetEmotion::ShyBlush; gaze = L2D_GAZE_AWAY;
+        icon = L"✿"; title = L"碰到了";
+        swprintf(bubble, 96, L"腿、腿……吓我一跳！（好感 +%d）", gain);
+    } else {  // L2D_PART_FOOT
+        slot = L2D_THINK; emo = PetEmotion::Panic; gaze = L2D_GAZE_AWAY;
+        icon = L"✿"; title = L"碰到了";
+        swprintf(bubble, 96, L"唔……脚痒痒的，别闹。");
+    }
+
+    if (slot == L2D_PEACE && !L2dSlotUnlocked(L2D_PEACE)) slot = L2D_THINK;
+    L2dPlayClip(slot);
+    L2dSetExpression(emo);
+    if (gaze >= 0) L2dSetGazeOverride(gaze, 1800);
+    (void)icon; (void)title;   // 气泡已停用，图标/标题不再使用（保留分支里的赋值以免大改）
+
+    // ★ 不再弹气泡：旁白 + 本地台词写进对话界面，并进入对话历史。
+    std::wstring narr = std::wstring(L"（") + L2dTouchNarration(part) + L"）";
+    AppendChatView(narr + L"\r\n\r\n茉子：" + std::wstring(bubble));
+    EnsureHistoryBlankLine();      // 这一轮到此结束，给下一轮留出空行
+    SaveChatHistory(narr, bubble);
+}
+
+static void DoBodyTouch(HWND hwnd, L2dBodyPart part) {
+    if (!Live2DReady()) return;
+    if (part == L2D_PART_NONE) return;
+
+    ULONGLONG now = GetTickCount64();
+    bool egg = false;
+    int  gain = 1;
+
+    // 好感规则（本地即时，不交给 LLM）：摸头连击彩蛋照旧；脸/手/胸/腹/裙/腿 +1，脚 +0。
+    if (part == L2D_PART_HEAD) {
+        bool combo = (g_lastPatMs != 0 && now - g_lastPatMs <= PAT_COMBO_WINDOW_MS);
+        g_patCombo = combo ? g_patCombo + 1 : 1;
+        g_lastPatMs = now;
+        egg = (g_patCombo >= PAT_COMBO_NEED && now - g_lastPatEggMs >= PAT_REWARD_COOLDOWN);
+        if (egg) { g_lastPatEggMs = now; g_patCombo = 0; }
+        gain = egg ? 2 : 1;
+    } else if (part == L2D_PART_FOOT) {
+        gain = 0;
+    }
+
+    bool applied = false;
+    if (gain > 0) {
+        applied = StatsAddAffinity(gain);
+        if (applied && g_stat.affinityMood < 0) {
+            std::lock_guard<std::recursive_mutex> lk(g_statMtx);
+            g_stat.affinityMood += 1;
+            if (g_stat.affinityMood > 0) g_stat.affinityMood = 0;
+        }
+    }
+    if (applied) {
+        UnlockCheck();
+        AffinityMaxCheck();
+        AchCheck();
+        StatsSave();
+        RequestPaint(true);
+        if (g_hAchPanel && IsWindow(g_hAchPanel)) InvalidateRect(g_hAchPanel, nullptr, FALSE);
+    }
+
+    // 即时反馈：音效 + 一个通用动作，让用户点了立刻有反应（LLM 有网络延迟）。
+    XSoundPlay(g_peace, false);
+    if (egg) XSoundPlay(g_think, false);
+    L2dPlayClip(L2D_THINK);
+
+    // ★ 是否走 LLM 驱动？开关默认开；节流冷却中 / 已有请求在跑 -> 走本地降级。
+    bool useLlm = GetLLMConfigInt(L"TouchLlmEnable", 1, 0, 1) != 0;
+    int  cooldownMs = GetLLMConfigInt(L"TouchCooldownMs", 1200, 0, 10000);
+    bool canAsk = useLlm && !g_touchRunning &&
+                  (g_lastTouchAskMs == 0 || now - g_lastTouchAskMs >= (ULONGLONG)cooldownMs);
+
+    if (canAsk) {
+        g_touchRunning = true;
+        g_lastTouchAskMs = now;
+        g_lastUserInputMs = now;   // 重置主动搭话静默计时，避免摸着摸着突然插话
+        // 触摸回复呈现层统一：TouchReplyMode
+        //   0=bubble（贴角色轻气泡，默认） / 1=openChat（自动开聊天窗） / 2=both
+        //   兼容旧配置 TouchAutoOpenChat（=1 等价 mode 1）。
+        int mode = GetLLMConfigInt(L"TouchReplyMode", 0, 0, 2);
+        if (mode == 0 && GetLLMConfigInt(L"TouchAutoOpenChat", 0, 0, 1) == 1)
+            mode = 1;              // 老配置迁移
+        if ((mode == 1 || mode == 2) && (!g_hChatWnd || !IsWindow(g_hChatWnd)))
+            OpenChatDialog();
+        // ★ 不再弹气泡：先在对话界面写下旁白（"茉子："后等回复填充），回复到达时再追加。
+        std::wstring narr = std::wstring(L"（") + L2dTouchNarration(part) + L"）";
+        g_touchPendingNarration = narr;
+        LLMThreadParam* param = new LLMThreadParam();
+        param->hwnd = hwnd;
+        param->input.clear();
+        param->touch = true;
+        param->touchPhrase = L2dTouchPhrase(part);
+        unsigned tid = 0;
+        if (!_beginthreadex(nullptr, 0, LLMThreadProc, param, 0, &tid)) {
+            delete param;
+            g_touchRunning = false;
+            g_touchPendingNarration.clear();
+            DoBodyTouchLocalFallback(part, egg, gain);  // 建线程失败 -> 本地反馈
+        } else {
+            // 线程起来后才写占位，避免和本地降级路径重复追加旁白
+            AppendChatView(narr + L"\r\n\r\n茉子：");
+        }
+    } else {
+        // 关闭 / 冷却中 / 正在请求：本地固定反馈，保证每次点击都有回应。
+        DoBodyTouchLocalFallback(part, egg, gain);
+    }
+}
+#endif
+
 // ================= 窗口过程 =================
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
@@ -4447,18 +10469,48 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         g_lastTickMs = GetTickCount64();     // 隐藏/恢复后重新开始计陪伴时长
         break;
+#if L2D_PIXEL_HITTEST
+    case WM_NCHITTEST: {
+        // 分层窗口默认整个矩形都吃鼠标消息，透明区会挡住桌面点击。
+        // 这里按离屏位图的 alpha 做命中：完全透明处让鼠标穿透下去。
+        int sx = (int)(short)LOWORD(lp), sy = (int)(short)HIWORD(lp);
+        RECT rc;
+        if (!GetWindowRect(hwnd, &rc)) return HTNOWHERE;
+        int x = sx - rc.left, y = sy - rc.top;
+        if (x < 0 || y < 0 || x >= g_cachedW || y >= g_cachedH) return HTTRANSPARENT;
+        if (g_dibBits) {
+            uint8_t a = g_dibBits[((size_t)y * (size_t)g_cachedW + (size_t)x) * 4 + 3];
+            if (a < L2D_HIT_ALPHA_MIN) return HTTRANSPARENT;
+        }
+        return HTCLIENT;
+    }
+#endif
     case WM_MOUSEWHEEL: {
         if (!g_preloadDone) return 0;            // 加载期不缩放，避免触发重建
         int delta = GET_WHEEL_DELTA_WPARAM(wp);
         if (delta > 0) g_zoom = min(g_zoom + 0.1f, 3.0f);
         else g_zoom = max(g_zoom - 0.1f, 0.5f);
+#if USE_LIVE2D
+        if (Live2DReady()) {
+            // 窗口宽高比跟着人物走，别再固定 2:3 空出大片透明区。
+            Live2DApplyWindowSize();   // 内部会按新位置重算半身状态
+            g_zoomLastMs = GetTickCount();
+            MarkGeomDirty();                       // ★ 缩放后立即记住尺寸
+            UpdateLayered();
+            return 0;
+        }
+#endif
         int newW = (int)(BASE_W * g_zoom), newH = (int)(BASE_H * g_zoom);
         RECT rc; GetWinRect(g_hwnd, rc);
         int nx = rc.left, ny = rc.bottom - newH;      // 以底边为锚缩放
+        POINT zoomAnchor{ (rc.left + rc.right) / 2, rc.bottom };
+        ClampToMonitor(zoomAnchor, newW, newH, nx, ny);   // 缩放也不许越过拖拽边界
         SetWindowPos(g_hwnd, HWND_TOPMOST, nx, ny, newW, newH, SWP_NOACTIVATE);
         g_currentW = newW; g_currentH = newH;
         g_winX = nx; g_winY = ny; g_winPosKnown = true;   // ★ 同步逻辑位置
+        RefreshHalfBodyFromPlacement(ny, newH, { nx + newW / 2, ny + newH });
         g_zoomLastMs = GetTickCount();
+        MarkGeomDirty();                              // ★ 缩放后立即记住尺寸
         UpdateLayered();
         return 0;
     }
@@ -4514,10 +10566,63 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (g_lastStatsSaveMs == 0) g_lastStatsSaveMs = nowMs;
                 if (nowMs - g_lastStatsSaveMs >= 60000) { g_lastStatsSaveMs = nowMs; StatsSave(); }
                 if (nowMs - g_lastAchCheckMs >= 3000)   { g_lastAchCheckMs = nowMs; AchCheck(); UnlockCheck(); AffinityMaxCheck(); }
+                // ★ 窗口位置/尺寸变过：静默 0.8s 就落盘。拖完、缩放完立刻记住，
+                //   不必等正常退出——被任务管理器结束也照样保住。
+                if (g_geomDirty && nowMs - g_geomDirtyMs >= 800) SaveWindowState();
+                // 聊天窗位置/尺寸同样静默 0.8s 落盘
+                MaybeSaveChatGeom();
+            }
+
+            // ★触摸请求超时兜底：占位气泡"（……）"若长时间没被回复覆盖，
+            //   说明这一轮 LLM 请求卡住了。给出明确提示并复位互斥标志，
+            //   避免界面永远停在"（……）"、让用户误以为"连不上 LLM"。
+            if (g_touchRunning && g_lastTouchAskMs != 0) {
+                int touchTimeout = GetLLMConfigInt(L"TouchTimeoutMs", 20000, 5000, 120000);
+                ULONGLONG nowT = GetTickCount64();
+                if (nowT - g_lastTouchAskMs > (ULONGLONG)touchTimeout) {
+                    g_touchRunning = false;
+                    // 错误提示高优先级（插队首，立即展示）
+                    if (!g_isChatting)
+                        ToastShowHi(L"⚠", L"连接超时",
+                            L"这次反应没回来，请检查网络或 llm.ini（DebugView 搜 [LLM]/[TOUCH] 看详情）");
+                    PetDbgW(L"[TOUCH] 请求超时，已复位互斥标志\n");
+                }
+            }
+
+            // 主动搭话调度：每隔一段时间，趁用户没在聊天/拖拽，让茉子主动开口。
+            //   配置项都在 llm.ini 的 [LLM] 段。
+            if (GetLLMConfigInt(L"ProactiveEnable", 1, 0, 1)) {
+                ULONGLONG nowP = GetTickCount64();
+                // 线程卡死兜底：超过 90 秒还没回主线程，强制解锁，避免以后再也不搭话
+                if (g_proactiveRunning && g_proactiveStartMs != 0 &&
+                    nowP - g_proactiveStartMs > 90000) {
+                    g_proactiveRunning = false;
+                }
+                if (!g_proactiveRunning && g_preloadDone && !g_isChatting && !g_bDragging) {
+                    if (g_lastProactiveMs == 0) g_lastProactiveMs = nowP;
+                    int intervalMs = GetLLMConfigInt(L"ProactiveIntervalSec", 180, 15, 86400) * 1000;
+                    int idleMs     = GetLLMConfigInt(L"ProactiveIdleSec", 60, 5, 86400) * 1000;
+                    bool quietEnough = (g_lastUserInputMs == 0 || nowP - g_lastUserInputMs >= (ULONGLONG)idleMs);
+                    if (nowP - g_lastProactiveMs >= (ULONGLONG)intervalMs && quietEnough) {
+                        g_proactiveRunning = true;
+                        g_proactiveStartMs = nowP;
+                        auto* pp = new LLMThreadParam();
+                        pp->hwnd = hwnd; pp->input.clear(); pp->proactive = true;
+                        unsigned int tid = 0;   // ★ _beginthreadex 第6参数要求 unsigned int*（x64 下 uintptr_t 是64位，会报 C2664）
+                        if (!_beginthreadex(nullptr, 0, LLMThreadProc, pp, 0, &tid)) {
+                            delete pp;                       // 起线程失败要还原标志并释放参数
+                            g_proactiveRunning = false;
+                        }
+                    }
+                }
             }
             ToastTick();                 // 成就解锁气泡推进（各自独立的分层窗口）
 
-            if (g_bTransitioning) {
+            // ★ 分段语音：上一句放完就接下一句（合成在后台线程，这里只做播放切换）
+            TtsPump();
+
+            if (g_bTransitioning && !Live2DReady()) {
+                // Live2D 没有"换图淡入淡出"这回事，别让过渡分支吞掉每帧重绘。
                 g_transitionTimer++;
                 UpdateLayered();
                 if (g_transitionTimer > TRANSITION_DURATION) {
@@ -4529,6 +10634,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     g_currentFrameIndex = 0;
                     g_idleActionTimer = 0; g_isRandomAction = false;
                     g_renderPrewarmReq = true;
+                    SaveConfig();          // ★ 序列帧换装路径也要立刻记住，别只靠退出时那一次
                 }
                 return 0;
             }
@@ -4539,6 +10645,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     g_currentFrames = g_frameCache[cc][ss];
                 if (!g_pendingDelete.empty()) ClearFrames(g_pendingDelete);
             }
+#if USE_LIVE2D
+            if (Live2DReady()) {
+                // 用定时器 + GetCursorPos 而不是 WM_MOUSEMOVE：鼠标在桌面别处时
+                // 分层窗口收不到鼠标消息，但角色仍应该看着它。
+                RECT rcLook;
+                if (GetWindowRect(hwnd, &rcLook)) Live2DLookAtCursor(rcLook);
+                Live2DAdvance();     // 逻辑帧只在这里推进，拖拽重绘不重复推进
+                UpdateLayered();
+            } else
+#endif
             if (!g_currentFrames.empty()) {
                 g_currentFrameIndex = (g_currentFrameIndex + 1) % (int)g_currentFrames.size();
                 UpdateLayered();
@@ -4547,7 +10663,23 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (g_currentState == AnimState::Idle && !g_isRandomAction) {
                     g_idleActionTimer++;
                     if (g_idleActionTimer > 360) {
-                        SwitchAnim(g_currentCostume, rand() % 2 == 0 ? AnimState::Think : AnimState::Peace);
+#if USE_LIVE2D
+                        if (Live2DReady()) {
+                            // 轮播：待机久了随机做点小动作。片段 2（开心）
+                            //   受好感解锁，没到门槛就只在"思考"里挑，不会出现
+                            //   状态已切、画面却没动的空档。
+#if DEV_UNLOCK_ALL
+                            bool peaceOk = true;
+#else
+                            bool peaceOk = g_stat.affinityTotal >= L2D_PEACE_NEED;
+#endif
+                            AnimState pick = (peaceOk && rand() % 2 == 0)
+                                ? AnimState::Peace : AnimState::Think;
+                            SwitchAnim(g_currentCostume, pick);
+                            L2dPlayState(pick);   // 强制驱动片段（含循环片段的重启）
+                        } else
+#endif
+                            SwitchAnim(g_currentCostume, rand() % 2 == 0 ? AnimState::Think : AnimState::Peace);
                         g_isRandomAction = true; g_idleActionTimer = 0;
                     }
                 } else if (g_isRandomAction) {
@@ -4557,26 +10689,133 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             } else g_idleActionTimer = 0;
         }
         return 0;
+    // 情绪反馈：Live2D 动作片段 + 音效 + 心情微调（三层反馈的动作/数值层）。
+    //   wParam = PetEmotion，lParam = 心情增量（-1/0/1）
+    case WM_APP_EMOTION: {
+        PetEmotion emo = (PetEmotion)(int)wp;
+        int moodDelta = (int)(int)lp;
+#if USE_LIVE2D
+        if (Live2DReady()) {
+            int slot = L2dSlotForEmotion(emo);
+            if (L2dSlotUnlocked(slot)) L2dPlayClip(slot);   // 未解锁的开心动作不越级播放
+            // ★ 表情联动：情绪驱动面部表情淡入淡出（动作 + 表情 + 语气三合一）。
+            //   旧 DLL 没有表情 API 时 L2dSetExpression 内部静默跳过，不影响动作。
+            L2dSetExpression(emo);
+            // 音效：正向情绪用 peace，低落/思考用 think，复用现有素材
+            if (emo == PetEmotion::Smile) XSoundPlay(g_peace, false);
+            else if (emo == PetEmotion::Embarrassed || emo == PetEmotion::Thinking) XSoundPlay(g_think, false);
+        }
+#endif
+        // 心情微调：只改 affinityMood（影响爱心液面），不动累计值；与对话好感结算互补。
+        if (moodDelta != 0) {
+            std::lock_guard<std::recursive_mutex> lk(g_statMtx);
+            g_stat.affinityMood += moodDelta;
+            if (g_stat.affinityMood > 0) g_stat.affinityMood = 0;        // 正心情封顶 0
+            if (g_stat.affinityMood < -AFFINITY_MOOD_FLOOR) g_stat.affinityMood = -AFFINITY_MOOD_FLOOR;
+            StatsSave();
+            RequestPaint(true);
+        }
+        return 0;
+    }
+    // 导演指令：一次性演出 动作/表情/视线/音效/心情。
+    //   lParam = new L2dDirectorCmd（由 LLM 线程投递），这里用完 delete。
+    //   action/gaze/intensity 为可选覆盖；缺省(-1/0)时完全退回 WM_APP_EMOTION 的旧行为。
+    case WM_APP_DIRECTOR: {
+        L2dDirectorCmd* cmd = (L2dDirectorCmd*)lp;
+        if (!cmd) return 0;
+        PetEmotion emo = cmd->emotion;
+        int moodDelta = cmd->moodDelta;
+#if USE_LIVE2D
+        if (Live2DReady()) {
+            // 动作：导演指定优先，否则按情绪映射
+            int slot = (cmd->action >= 0) ? cmd->action : L2dSlotForEmotion(emo);
+            if (L2dSlotUnlocked(slot)) L2dPlayClip(slot);
+            // 表情：情绪驱动（intensity 目前只留作后续强度演出的扩展位，不影响口吻）
+            L2dSetExpression(emo);
+            // 视线：导演指定则覆盖，到期自动恢复跟随鼠标（在 Live2DLookAtCursor 里处理）
+            if (cmd->gaze >= 0) L2dSetGazeOverride(cmd->gaze, cmd->gazeHoldMs);
+            // 音效：正向情绪用 peace，低落/思考用 think
+            if (emo == PetEmotion::Smile) XSoundPlay(g_peace, false);
+            else if (emo == PetEmotion::Embarrassed || emo == PetEmotion::Thinking) XSoundPlay(g_think, false);
+        }
+#endif
+        if (moodDelta != 0) {
+            std::lock_guard<std::recursive_mutex> lk(g_statMtx);
+            g_stat.affinityMood += moodDelta;
+            if (g_stat.affinityMood > 0) g_stat.affinityMood = 0;
+            if (g_stat.affinityMood < -AFFINITY_MOOD_FLOOR) g_stat.affinityMood = -AFFINITY_MOOD_FLOOR;
+            StatsSave();
+            RequestPaint(true);
+        }
+        delete cmd;
+        return 0;
+    }
+    // ★触摸互动结果：弹气泡显示模型对这次触碰的反应，lParam = new std::wstring，用完释放。
+    //   表情/动作/视线由随后到达的 WM_APP_DIRECTOR 驱动（均来自同一轮 LLM 回复）。
+    case WM_APP_TOUCH_REPLY: {
+        std::wstring* text = (std::wstring*)lp;
+        if (text) {
+            // 触摸回复呈现层统一：
+            //   1) 聊天窗打开时 -> 进窗口（接在先前"茉子："占位后）并写历史；
+            //   2) 未打开且 mode=气泡/都要 -> 贴角色轻气泡显示截断的 1-2 句；
+            //   3) 未打开且 mode=开窗口 -> 已自动开窗口，回复已在窗口里。
+            //   表情/动作/视线仍由随后到达的 WM_APP_DIRECTOR 驱动（同一轮回复）。
+            std::wstring reply = *text;
+            if (reply.empty()) reply = L"（未收到回复）";
+            bool chatOpen = (g_hChatWnd && IsWindow(g_hChatWnd));
+            if (chatOpen) {
+                AppendChatTail(reply);          // 接在"茉子："后面，并补上段尾空行
+            } else {
+                int mode = GetLLMConfigInt(L"TouchReplyMode", 0, 0, 2);
+                if (mode == 0 || mode == 2)     // 气泡 / 都要
+                    // 模型回复属"当前互动"，高优先级插队首
+                    ToastShowHi(L"✿", L"茉子", TruncateReply(reply).c_str());
+            }
+            // 历史落盘：触摸的"旁白 + 回复"成对写盘放在主线程做（只此一处，
+            //   避免和 LLM 线程双写）。g_touchPendingNarration 是触摸专用槽。
+            if (!g_touchPendingNarration.empty())
+                SaveChatHistory(g_touchPendingNarration, reply);
+            g_touchPendingNarration.clear();
+            delete text;
+        }
+        g_lastUserInputMs = GetTickCount64();   // 触摸也是一种互动，重置主动搭话静默计时
+        return 0;
+    }
+    // 主动搭话结果：弹气泡显示，lParam = new std::wstring，用完释放。
+    case WM_APP_PROACTIVE: {
+        std::wstring* text = (std::wstring*)lp;
+        if (text) {
+            if (!text->empty()) {
+                // 标题带上当前情绪，让"表情"这一维在气泡上也能被看见
+                std::wstring title = std::wstring(L"茉子·") + EmotionLabel((PetEmotion)(int)wp);
+                // 主动搭话是茉子主动开口，高优先级插队首；可点击展开聊天窗
+                ToastEnqueueMsg(L"💬", title.c_str(), text->c_str(), 0, /*clickable=*/true);
+                if (g_toastBit < 0) ToastItemPop();
+            }
+            delete text;
+        }
+        g_lastProactiveMs = GetTickCount64();
+        g_proactiveRunning = false;   // 兜底还原互斥标志
+        return 0;
+    }
     case WM_APP_AFFINITY: {
         int delta = (int)wp - AFFINITY_MSG_BIAS;
         bool applied = StatsAddAffinityChat(delta);
         if (g_hHistoryEdit && IsWindow(g_hHistoryEdit)) {
-            wchar_t line[80];
+            wchar_t line[96];
             if (delta > 0 && applied)
-                swprintf(line, 80, L"\r\n\r\n（茉子对你的好感 +%d）", delta);
+                swprintf(line, 96, L"（茉子对你的好感 +%d）", delta);
             else if (delta > 0 && AffinityMaxed())
                 // 满心之后不再累计，别把它报成"今日已达上限"——那会让人以为明天还能涨
-                swprintf(line, 80, L"\r\n\r\n（茉子的心意已经满了）");
+                swprintf(line, 96, L"（茉子的心意已经满了）");
             else if (delta > 0)
-                swprintf(line, 80, L"\r\n\r\n（茉子对你的好感 +%d，但今日已达上限 %d，明天再来陪她吧）", delta, AFFINITY_DAY_CAP);
+                swprintf(line, 96, L"（茉子对你的好感 +%d，但今日已达上限 %d，明天再来陪她吧）", delta, AFFINITY_DAY_CAP);
             else if (delta < 0)
-                swprintf(line, 80, L"\r\n\r\n（茉子对你的好感 %d）", delta);
+                swprintf(line, 96, L"（茉子对你的好感 %d）", delta);
             else
-                swprintf(line, 80, L"\r\n\r\n（茉子的心情没有变化）");
-            DWORD end = GetWindowTextLengthW(g_hHistoryEdit);
-            SendMessageW(g_hHistoryEdit, EM_SETSEL, (WPARAM)end, (LPARAM)end);
-            SendMessageW(g_hHistoryEdit, EM_REPLACESEL, TRUE, (LPARAM)line);
-            SendMessageW(g_hHistoryEdit, EM_LINESCROLL, 0, 10000);
+                swprintf(line, 96, L"（茉子的心情没有变化）");
+            // 好感提示单独成段：换行交给统一入口，不再手写 "\r\n\r\n" 前缀
+            AppendChatView(std::wstring(line));
         }
         UnlockCheck();
         AffinityMaxCheck();
@@ -4597,7 +10836,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_hAchPanel && IsWindow(g_hAchPanel)) InvalidateRect(g_hAchPanel, nullptr, FALSE);
         return 0;
     }
-    case WM_APP_PRELOAD_DONE:
+    case WM_APP_PRELOAD_DONE: {
+        // ★ 这条消息不只启动时会来：从 Live2D 切回序列帧时，后台加载线程跑完
+        //   也会再发一次。开机专属的副作用（启动音、BGM、首帧提示）只做一次，
+        //   否则每次切渲染方式都会把 BGM 从头放一遍。
+        bool firstBoot = !g_bootDone;
+        g_bootDone = true;
+#if USE_LIVE2D
+        if (!Live2DReady())
+#endif
         SwitchAnim(g_currentCostume, AnimState::Idle);
         // ★ 一套素材都没解出来：多半是没放 Animations。
         //   不提示的话用户只会看到一个空白窗口，完全不知道出了什么事。
@@ -4606,26 +10853,36 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             for (int c = 0; c < 4 && !anyFrame; ++c)
                 for (int s = 0; s < 4 && !anyFrame; ++s)
                     if (g_frameCached[c][s] && !g_frameCache[c][s].empty()) anyFrame = true;
-            if (!anyFrame)
+            if (!anyFrame && !Live2DReady())
                 ToastShow(L"📂", L"没有找到序列帧素材",
                           L"请把图片放到 exe 同级的 Animations\\服装\\动作\\ 下，目录结构见 README。");
+        }
+        // ★ 存档里选的是 Live2D，但这次没扫到模型：先按序列帧跑，提醒一次，
+        //   补齐素材后可以直接在右键菜单里切过去，不用重开程序。
+        if (g_modeFallbackNotice) {
+            g_modeFallbackNotice = false;
+            ToastShow(L"🖼", L"Live2D 没起来",
+                      L"已用序列帧显示。缺素材请补 p2l_runtime.dll 与 live2d\\；素材齐全则看 DebugView 的 [MakotoPet]。修好后可在右键菜单「渲染方式」里切换。");
         }
         if (!IsWindowVisible(hwnd)) { ShowWindow(hwnd, SW_SHOW); UpdateWindow(hwnd); }
         if (!g_timerOn) { g_timerOn = true; SetTimer(hwnd, 1, FRAME_INTERVAL_MS, nullptr); }
         if (!g_bStartupPlayed) { g_bStartupPlayed = true; PlayStartupAudio(); }
         g_lastTickMs = GetTickCount64();
         TraySetTip(L"常陆茉子桌宠");
-        if (UnlockReady(UNLOCK_BGM)) PlayBGMByIndex(g_currentBGMIndex);   // 未解锁则安静启动
+        // 未解锁则安静启动；切渲染方式重跑加载线程时不要再重放 BGM
+        if (firstBoot && UnlockReady(UNLOCK_BGM)) PlayBGMByIndex(g_currentBGMIndex);
         UnlockCheck();               // 补弹：老存档已有高好感但从未提示过的情况
         AffinityMaxCheck();
         RequestPaint(true);
         return 0;
+    }
     case WM_TRAY:
         if (wp == 1 && lp == WM_RBUTTONUP) ShowContextMenu(hwnd);
         break;
     case WM_LBUTTONDOWN:
         if (!g_preloadDone) return 0;            // 加载期不接受交互
         g_bDragging = false;
+        g_ptLButtonDownTick = GetTickCount64();  // ★记录按下时刻（区分点击/按住拖）
         GetCursorPos(&g_ptLButtonDown);
         { RECT rc; GetWindowRect(hwnd, &rc); g_dragWindowStart.x = rc.left; g_dragWindowStart.y = rc.top; }
         SetCapture(hwnd); return 0;
@@ -4644,24 +10901,101 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             //   高刷鼠标下主线程被合成占满就是拖动卡顿的根因。这里只更新逻辑位置，
             //   由 UpdateLayeredWindow 一次性把位置和内容都带过去。
             g_winX = nx; g_winY = ny; g_winPosKnown = true;
+            RefreshHalfBodyFromPlacement(ny, g_currentH, pt);   // 往下拖越界即半身，往上拖回来即全身
+            MarkGeomDirty();                                   // ★ 拖完就记住位置
             RequestPaint();
         }
         return 0;
-    case WM_LBUTTONUP:
+    case WM_LBUTTONUP: {
         if (!g_preloadDone) return 0;            // 加载期不接受交互
+        // 区分拖动与点击：
+        //   坑点在于 ReleaseCapture() 会【同步】给本窗口发 WM_CAPTURECHANGED，
+        //   而那个分支里会把 g_bDragging 清成 false —— 先释放再判断的话，
+        //   哪怕刚才拖得很明显，走到这里也会被当成"点击"去摸头摸手。
+        //   所以这里先在本地算好"这一下是拖还是点"，再动 capture。
+        POINT pt{}; GetCursorPos(&pt);
+        const int dx = abs(pt.x - g_ptLButtonDown.x);
+        const int dy = abs(pt.y - g_ptLButtonDown.y);
+        int slop = (int)GetSystemMetrics(SM_CXDRAG) - 1;
+        if (slop < 3) slop = 3;
+        const bool windowMoved = g_winPosKnown &&
+            (g_winX != g_dragWindowStart.x || g_winY != g_dragWindowStart.y);
+        // 按住超过 0.7 秒仍没松手：多半是"按住准备拖"，松手时别奖励一次触摸
+        const bool heldTooLong = (g_ptLButtonDownTick != 0) &&
+            (GetTickCount64() - g_ptLButtonDownTick > 700);
+        const bool wasDragging = g_bDragging;
+        const bool treatedAsDrag = wasDragging || windowMoved || dx > slop || dy > slop || heldTooLong;
+
         if (GetCapture() == hwnd) ReleaseCapture();
-        if (g_bDragging) { g_bDragging = false; SwitchAnim(g_currentCostume, AnimState::Idle); }
-        else {
-            switch (g_currentState) {
-            case AnimState::Idle: SwitchAnim(g_currentCostume, AnimState::Think); break;
-            case AnimState::Think: SwitchAnim(g_currentCostume, AnimState::Peace); break;
-            default: SwitchAnim(g_currentCostume, AnimState::Idle); break;
+        g_bDragging = false;
+        g_ptLButtonDownTick = 0;
+
+        if (treatedAsDrag) {
+            if (wasDragging || windowMoved) {
+                // 往下拖过半身阈值就吸附到标准沉底位置；没过阈值则保留玩家自己摆的位置。
+                int snappedY = g_winY;
+                SnapHalfBodyOnDragEnd(pt, snappedY);
+                if (snappedY != g_winY) {
+                    g_winY = snappedY;
+                    RequestPaint(true);
+                }
+                SwitchAnim(g_currentCostume, AnimState::Idle);
+            }
+            return 0;                            // 拖拽收尾：绝不触发身体交互
+        }
+#if USE_LIVE2D
+        // 按部位分发触摸互动（头/脸/手/身），点不到人物才走状态轮转
+        if (Live2DReady()) {
+            int cx = (int)(short)LOWORD(lp), cy = (int)(short)HIWORD(lp);
+            L2dBodyPart part = Live2DHitPart(cx, cy);
+            if (part != L2D_PART_NONE) {
+                DoBodyTouch(hwnd, part);
+                // ★触摸物理反馈：抓住裙摆/裤腿拉一下再回弹（本地即时，不等 LLM）。
+                L2dClothTug(cx, cy, part);
+                return 0;
             }
         }
+#endif
+        switch (g_currentState) {
+        case AnimState::Idle: SwitchAnim(g_currentCostume, AnimState::Think); break;
+        case AnimState::Think: SwitchAnim(g_currentCostume, AnimState::Peace); break;
+        default: SwitchAnim(g_currentCostume, AnimState::Idle); break;
+        }
         return 0;
+    }
+    // ★附件入口③：图片/文件直接拖到桌宠身上 → 自动开聊天窗并挂上附件
+    case WM_DROPFILES: {
+        HDROP hd = (HDROP)wp;
+        UINT n = DragQueryFileW(hd, 0xFFFFFFFF, nullptr, 0);
+        std::vector<std::wstring> paths;
+        for (UINT i = 0; i < n; ++i) {
+            wchar_t p[MAX_PATH * 2] = { 0 };
+            if (DragQueryFileW(hd, i, p, MAX_PATH * 2)) paths.push_back(p);
+        }
+        DragFinish(hd);
+        OpenChatDialog();
+        int added = 0;
+        std::wstring firstErr;
+        for (const std::wstring& p : paths) {
+            std::wstring err;
+            if (AddAttachmentFromPath(p, err)) ++added;
+            else if (firstErr.empty()) firstErr = err;
+        }
+        RefreshAttachStrip();
+        if (g_hChatWnd && IsWindow(g_hChatWnd)) {
+            SetForegroundWindow(g_hChatWnd);
+            LayoutChatChildren(g_hChatWnd);
+            ChatSetStatus(g_hChatWnd, firstErr.empty()
+                ? (L"已添加 " + std::to_wstring(added) + L" 个附件，按 Enter 发送")
+                : (L"⚠ " + firstErr));
+        }
+        return 0;
+    }
     case WM_WINDOWPOSCHANGED: {
         WINDOWPOS* pwp = (WINDOWPOS*)lp;
         if (pwp && !(pwp->flags & SWP_NOMOVE)) { g_winX = pwp->x; g_winY = pwp->y; g_winPosKnown = true; }
+        // 位置/尺寸被外部改过（拖动、贴边、分辨率变化）也记一笔，交给定时器落盘
+        if (pwp && !(pwp->flags & (SWP_NOMOVE | SWP_NOSIZE))) MarkGeomDirty();
         break;
     }
     case WM_CAPTURECHANGED:
@@ -4679,13 +11013,33 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CONTEXTMENU:
         ShowContextMenu(hwnd);
         return 0;
+    // ★ 关机 / 注销：Windows 不保证随后还会走 WM_DESTROY，先落盘再放行。
+    case WM_ENDSESSION:
+        if (wp) { TtsStopAll(); SaveConfig(); }
+        return 0;
     case WM_DESTROY: {
+        // ★ 常驻 whisper-server 是子进程，主程序退出必须带走，否则会残留在后台吃内存
+        AsrServerStop();
+        // ★ 先收拾语音：合成线程还在 HTTP 中途时，
+        //   不能让它在 XAudio2 / rig 已销毁后继续跑（会崩在后台线程）。
+        TtsStopAll();
+        g_ttsQuit.store(true);
+        if (g_hTtsEvent) SetEvent(g_hTtsEvent);
+        if (g_hTtsWorker) {
+            WaitForSingleObject(g_hTtsWorker, 3000);   // 超时也不强留：程序即将退出
+            CloseHandle(g_hTtsWorker); g_hTtsWorker = nullptr;
+        }
+        if (g_hTtsEvent) { CloseHandle(g_hTtsEvent); g_hTtsEvent = nullptr; }
         SaveConfig(); KillTimer(hwnd, 1); StopBGM();
+#if USE_LIVE2D
+        // 桌宠是长驻进程，不能像示例程序那样靠进程退出回收句柄。
+        Live2DShutdown();
+#endif
         if (g_exit.loaded) { PlayExitAudio(); WaitForSoundToFinish(g_exit, 2000); }
         TrayRemove();
         if (g_gfx) { delete g_gfx; g_gfx = nullptr; }
         if (g_memDC) { SelectObject(g_memDC, g_hOldBmp); DeleteObject(g_hMemBmp); DeleteDC(g_memDC); }
-        g_memDC = nullptr; g_hMemBmp = nullptr; g_hOldBmp = nullptr;
+        g_memDC = nullptr; g_hMemBmp = nullptr; g_hOldBmp = nullptr; g_dibBits = nullptr;
         // ★ 帧由缓存独占：这里只断开引用，绝不能 ClearFrames（否则二次释放）
         g_currentFrames.clear(); g_pendingFrames.clear();
         RenderCacheInvalidate();   // ★ 必须在 GdiplusShutdown 之前释放 GDI+ 对象
@@ -4713,8 +11067,323 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
+// ==================================================================
+//  ★设置面板（数据驱动）：把 llm.ini 里所有"玩家有权手动设置"的参数
+//   集中到一个窗口，按类别分页呈现；左侧类别 ListBox + 右侧动态字段控件，
+//   支持"保存设置 / 恢复本页默认"，保存即写回 llm.ini 并即时生效。
+//   覆盖 [LLM] / [UI] / [TTS] 三段；[State] 的音量/渲染/缩放已有右键菜单，
+//   [Chat]/[Stats]/[State] 的位置与统计属于程序自管理，不暴露。
+// ==================================================================
+enum SetKind { SK_INT, SK_DOUBLE, SK_TEXT, SK_ENUM };
+struct SetChoice { int value; const wchar_t* label; };
+struct SettingField {
+    const wchar_t* section;   // llm.ini 段名
+    const wchar_t* key;
+    const wchar_t* label;     // 中文说明
+    SetKind kind;
+    const wchar_t* def;       // 默认值（字符串）
+    double lo, hi;            // 数值范围（INT/DOUBLE 校验用）
+    const SetChoice* choices; // ENUM 选项，value==-1 结束
+};
+
+static const SetChoice CH_ONOFF[]      = { {0,L"关闭"},{1,L"开启"},{-1,nullptr} };
+static const SetChoice CH_TOUCHREPLY[] = { {0,L"气泡显示"},{1,L"打开聊天窗"},{2,L"气泡+窗口"},{-1,nullptr} };
+static const SetChoice CH_LONGFORM[]   = { {2,L"自动判断"},{0,L"强制短文"},{1,L"强制长文"},{-1,nullptr} };
+static const SetChoice CH_THEME[]      = { {0,L"浅色"},{1,L"深色"},{-1,nullptr} };
+static const SetChoice CH_SKIPMODE[]   = { {0,L"禁用跳过"},{1,L"点击跳过"},{2,L"点击跳过+加速"},{-1,nullptr} };
+
+// 全部字段（顺序即索引，类别表用 first/count 引用）
+static const SettingField SET_FIELDS[] = {
+    // —— 连接与模型 ——
+    {L"LLM",L"ApiUrl", L"接口地址 ApiUrl",        SK_TEXT,   L"",      0,0,nullptr},
+    {L"LLM",L"ApiKey", L"API 密钥 ApiKey",         SK_TEXT,   L"",      0,0,nullptr},
+    {L"LLM",L"Model",  L"模型名称 Model",          SK_TEXT,   L"",      0,0,nullptr},
+    // —— 采样与生成 ——
+    {L"LLM",L"MaxTokens",           L"回复上限 MaxTokens",      SK_INT,    L"3000", 256,16384,nullptr},
+    {L"LLM",L"Temperature",         L"随机性 Temperature",      SK_DOUBLE, L"0.9",  0,2,nullptr},
+    {L"LLM",L"TopP",                L"核采样 TopP",             SK_DOUBLE, L"0.95", 0,1,nullptr},
+    {L"LLM",L"PresencePenalty",     L"话题惩罚 PresencePenalty",SK_DOUBLE, L"0.6", -2,2,nullptr},
+    {L"LLM",L"FrequencyPenalty",    L"用词惩罚 FrequencyPenalty",SK_DOUBLE,L"0.3", -2,2,nullptr},
+    {L"LLM",L"EnableThinking",      L"模型思考链",              SK_ENUM,   L"0",    0,0,CH_ONOFF},
+    {L"LLM",L"UsePenalty",          L"启用惩罚参数",            SK_ENUM,   L"1",    0,0,CH_ONOFF},
+    {L"LLM",L"UseResponseFormat",   L"JSON 格式约束",           SK_ENUM,   L"1",    0,0,CH_ONOFF},
+    {L"LLM",L"UseChatTemplateKwargs",L"模板参数覆盖",           SK_ENUM,   L"0",    0,0,CH_ONOFF},
+    // —— 长文·历史·记忆 ——
+    {L"LLM",L"LongMode",        L"长文模式总开关",       SK_ENUM, L"1",   0,0,CH_ONOFF},
+    {L"LLM",L"LongMaxTokens",   L"长文上限 LongMaxTokens",SK_INT, L"8000",256,32768,nullptr},
+    {L"LLM",L"LongFormManual",  L"长文判定模式",          SK_ENUM, L"2",   0,0,CH_LONGFORM},
+    {L"LLM",L"HistoryMaxChars", L"对话历史字数上限",      SK_INT,  L"4000",500,60000,nullptr},
+    {L"LLM",L"HistoryArchiveKB",L"历史归档阈值(KB)",      SK_INT,  L"512", 0,8192,nullptr},
+    {L"LLM",L"MemoryExpireDays",L"记忆淘汰天数",          SK_INT,  L"180", 0,3650,nullptr},
+    {L"LLM",L"MemoryEnable",    L"长期记忆开关",          SK_ENUM, L"1",   0,0,CH_ONOFF},
+    // —— 对话机制 ——
+    {L"LLM",L"DirectorEnable",      L"导演指令(情绪/动作)",  SK_ENUM, L"1",   0,0,CH_ONOFF},
+    {L"LLM",L"EmotionTone",         L"情绪语气联动",        SK_ENUM, L"1",   0,0,CH_ONOFF},
+    {L"LLM",L"EmotionAffinity",     L"情绪影响好感",        SK_ENUM, L"1",   0,0,CH_ONOFF},
+    {L"LLM",L"ProactiveEnable",     L"主动搭话开关",        SK_ENUM, L"1",   0,0,CH_ONOFF},
+    {L"LLM",L"ProactiveSaveHistory",L"主动搭话写入历史",    SK_ENUM, L"1",   0,0,CH_ONOFF},
+    {L"LLM",L"ProactiveSummaryChars",L"主动搭话摘要字数",   SK_INT,  L"400", 0,2000,nullptr},
+    {L"LLM",L"ProactiveIntervalSec",L"主动搭话间隔(秒)",    SK_INT,  L"180", 15,86400,nullptr},
+    {L"LLM",L"ProactiveIdleSec",    L"空闲判定(秒)",        SK_INT,  L"60",  5,86400,nullptr},
+    {L"LLM",L"ProactiveMaxTokens",  L"主动搭话字数上限",    SK_INT,  L"300", 128,2000,nullptr},
+    // —— 触摸互动 ——
+    {L"LLM",L"TouchLlmEnable",   L"触摸由 AI 回复",        SK_ENUM, L"1",    0,0,CH_ONOFF},
+    {L"LLM",L"TouchReplyMode",   L"触摸回复呈现方式",      SK_ENUM, L"0",    0,0,CH_TOUCHREPLY},
+    {L"LLM",L"TouchAutoOpenChat",L"气泡时自动开聊天窗(旧)",SK_ENUM, L"0",    0,0,CH_ONOFF},
+    {L"LLM",L"TouchCooldownMs",  L"触摸冷却(毫秒)",        SK_INT,  L"1200", 0,10000,nullptr},
+    {L"LLM",L"TouchTimeoutMs",   L"触摸请求超时(毫秒)",    SK_INT,  L"20000",5000,120000,nullptr},
+    {L"LLM",L"TouchMaxTokens",   L"触摸回复字数上限",      SK_INT,  L"1200", 256,4000,nullptr},
+    {L"LLM",L"TouchSkirtEnable", L"摸裙摆物理反馈",        SK_ENUM, L"1",    0,0,CH_ONOFF},
+    {L"LLM",L"TouchTugScale",    L"裙摆拉扯幅度",          SK_DOUBLE,L"1.0", 0,3,nullptr},
+    // —— 打字机·界面 ——
+    {L"LLM",L"TypewriterTargetMs",   L"打字机总时长(毫秒)",  SK_INT,  L"6000",500,120000,nullptr},
+    {L"LLM",L"TypewriterMinDelayMs", L"每字最小延时(毫秒)",  SK_INT,  L"2",    0,500,nullptr},
+    {L"LLM",L"TypewriterMaxDelayMs", L"每字最大延时(毫秒)",  SK_INT,  L"30",   1,500,nullptr},
+    {L"UI", L"TypewriterSkipMode",   L"跳过/加速模式",       SK_ENUM, L"1",    0,0,CH_SKIPMODE},
+    {L"UI", L"ChatTheme",            L"聊天窗主题",          SK_ENUM, L"0",    0,0,CH_THEME},
+    {L"UI", L"ChatFontPt",           L"聊天字号(点)",        SK_INT,  L"16",   8,40,nullptr},
+    {L"UI", L"ChatFontFace",         L"聊天字体",            SK_TEXT, L"Segoe UI Emoji",0,0,nullptr},
+    // 半身模式不再做设置项：直接往下拖出屏幕即可，状态随窗口坐标保存。
+    // —— 语音·基础 ——
+    {L"TTS",L"TtsEnable",      L"语音朗读总开关",     SK_ENUM, L"1",      0,0,CH_ONOFF},
+    {L"TTS",L"TtsHost",        L"服务地址 TtsHost",   SK_TEXT, L"127.0.0.1",0,0,nullptr},
+    {L"TTS",L"TtsPort",        L"服务端口 TtsPort",   SK_INT,  L"9880",   1,65535,nullptr},
+    {L"TTS",L"TtsTimeoutMs",   L"合成超时(毫秒)",     SK_INT,  L"45000",  1000,600000,nullptr},
+    {L"TTS",L"TtsMaxChars",    L"最多朗读字数",       SK_INT,  L"600",    0,100000,nullptr},
+    {L"TTS",L"TtsSegMaxChars", L"分段字数上限",       SK_INT,  L"60",     12,300,nullptr},
+    {L"TTS",L"TtsSplit",       L"长文本分段",         SK_ENUM, L"1",      0,0,CH_ONOFF},
+    {L"TTS",L"TtsShowError",   L"合成失败时提示",     SK_ENUM, L"1",      0,0,CH_ONOFF},
+    // —— 附件·语音输入 ——
+    //   只暴露玩家真正需要调的 4+1 项；whisper 路径/模型、PDF 工具路径留 ini，
+    //   属于"改错就废"的部署参数，不往 UI 上放。
+    {L"Attach",L"ImageMaxSide", L"图片最长边(像素)",   SK_INT,  L"1280", 512,  2048, nullptr},
+    {L"Attach",L"TextMaxChars", L"文本附件字数上限",   SK_INT,  L"12000",1000, 40000,nullptr},
+    {L"Attach",L"MaxFiles",     L"单次最多附件数",     SK_INT,  L"4",    1,    8,    nullptr},
+    {L"Attach",L"CacheDays",    L"图片缓存保留(天)",   SK_INT,  L"30",   0,    365,  nullptr},
+    {L"ASR",   L"Enable",       L"语音输入开关",       SK_ENUM, L"0",    0,0,  CH_ONOFF},
+    {L"ASR",   L"Threads",      L"识别线程数",         SK_INT,  L"4",    1,    32,   nullptr},
+    {L"ASR",   L"MaxSeconds",   L"最长录音(秒)",       SK_INT,  L"30",   5,    120,  nullptr},
+    {L"ASR",   L"ServerMode",   L"常驻加速(首字更快)", SK_ENUM, L"1",    0,0,  CH_ONOFF},
+    {L"Attach",L"OcrEnable",    L"扫描件 OCR",         SK_ENUM, L"1",    0,0,  CH_ONOFF},
+    {L"Attach",L"OcrMaxPages",  L"OCR 最多页数",       SK_INT,  L"3",    1,    20,   nullptr},
+    // ★语音高级参数（TtsTextLang / TtsVersion / TtsTopK / TtsRefAudio / TtsExtraJson 等）
+    //   不再呈现给玩家：属 GPT-SoVITS 调参项，玩家改错会直接导致语音不可用。
+    //   程序仍从 llm.ini 读取它们，需要时手改 ini 即可。
+};
+static const int SET_FIELD_COUNT = (int)(sizeof(SET_FIELDS)/sizeof(SET_FIELDS[0]));
+
+struct SetCategory { const wchar_t* name; int first; int count; };
+static const SetCategory SET_CATS[] = {
+    {L"连接与模型",     0, 3},
+    {L"采样与生成",     3, 9},
+    {L"长文·历史·记忆",12, 7},
+    {L"对话机制",      19, 9},
+    {L"触摸互动",      28, 8},
+    {L"打字机·界面",   36, 7},
+    {L"语音·基础",     43, 8},
+    {L"附件·输入",     51, 10},
+};
+static const int SET_CAT_COUNT = (int)(sizeof(SET_CATS)/sizeof(SET_CATS[0]));
+
+static const int SET_ID_LIST      = 22000;
+static const int SET_ID_LBL_BASE  = 23000;
+static const int SET_ID_CTL_BASE  = 24000;
+static const int SET_ID_SAVE      = 25001;
+static const int SET_ID_RESET     = 25002;
+static const int SET_ID_CLOSE     = 25003;
+static const int SET_MAX_ROWS     = 16;   // 单页最多字段数（当前最多 9）
+static HWND g_hSettingsWnd = nullptr;
+static HWND g_hSetList = nullptr;
+static HWND g_hSetLabel[SET_MAX_ROWS] = {};
+static HWND g_hSetCtl[SET_MAX_ROWS] = {};
+static int  g_setCurCat = 0;
+static int  g_setCurCount = 0;
+
+// 写任意段配置（GetIniStr 的对应写函数）
+static void SetIniStr(const wchar_t* sec, const wchar_t* key, const wchar_t* val) {
+    std::wstring dir;
+    if (!GetExeDir(dir)) return;
+    std::wstring p = dir + L"\\llm.ini";
+    WritePrivateProfileStringW(sec, key, val, p.c_str());
+}
+
+// 渲染某个类别的字段控件（先销毁上一页再新建）
+static void SetLoadCategory(int cat) {
+    if (cat < 0 || cat >= SET_CAT_COUNT) return;
+    // 先销毁上一页：数量钳到数组上限，避免历史脏值越界访问 g_hSetLabel/g_hSetCtl
+    int prevCount = (g_setCurCount < SET_MAX_ROWS) ? g_setCurCount : SET_MAX_ROWS;
+    for (int i = 0; i < prevCount; ++i) {
+        if (g_hSetLabel[i]) { DestroyWindow(g_hSetLabel[i]); g_hSetLabel[i] = nullptr; }
+        if (g_hSetCtl[i])   { DestroyWindow(g_hSetCtl[i]);   g_hSetCtl[i]   = nullptr; }
+    }
+    g_setCurCat = cat;
+    // ★安全：SET_CATS 的 first/count 与 SET_FIELDS 实际条数是手工维护的，
+    //   任何一次加字段漏改都会让 SET_FIELDS[first+i] 越界。这里统一做钳制。
+    const int first = SET_CATS[cat].first;
+    if (first < 0 || first >= SET_FIELD_COUNT) { g_setCurCount = 0; return; }
+    int cnt = SET_CATS[cat].count;
+    if (cnt < 0) cnt = 0;
+    if (cnt > SET_FIELD_COUNT - first) cnt = SET_FIELD_COUNT - first;
+    if (cnt > SET_MAX_ROWS) cnt = SET_MAX_ROWS;
+    g_setCurCount = cnt;
+    for (int i = 0; i < g_setCurCount; ++i) {
+        const SettingField& f = SET_FIELDS[first + i];
+        int y = 10 + i * 32;
+        g_hSetLabel[i] = CreateWindowExW(0, L"STATIC", f.label,
+            WS_CHILD | WS_VISIBLE | SS_LEFT, 182, y + 3, 310, 22,
+            g_hSettingsWnd, (HMENU)(INT_PTR)(SET_ID_LBL_BASE + i),
+            GetModuleHandleW(nullptr), nullptr);
+        std::wstring cur = GetIniStr(f.section, f.key, f.def);
+        if (f.kind == SK_ENUM) {
+            g_hSetCtl[i] = CreateWindowExW(0, L"COMBOBOX", L"",
+                WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP,
+                500, y, 210, 200, g_hSettingsWnd, (HMENU)(INT_PTR)(SET_ID_CTL_BASE + i),
+                GetModuleHandleW(nullptr), nullptr);
+            int curVal = _wtoi(cur.c_str()), sel = 0;
+            for (int k = 0; f.choices && f.choices[k].value != -1; ++k) {
+                int idx = (int)SendMessageW(g_hSetCtl[i], CB_ADDSTRING, 0, (LPARAM)f.choices[k].label);
+                SendMessageW(g_hSetCtl[i], CB_SETITEMDATA, idx, f.choices[k].value);
+                if (f.choices[k].value == curVal) sel = idx;
+            }
+            SendMessageW(g_hSetCtl[i], CB_SETCURSEL, sel, 0);
+        } else {
+            g_hSetCtl[i] = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", cur.c_str(),
+                WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | WS_TABSTOP,
+                500, y, 210, 24, g_hSettingsWnd, (HMENU)(INT_PTR)(SET_ID_CTL_BASE + i),
+                GetModuleHandleW(nullptr), nullptr);
+        }
+    }
+}
+
+// 保存设置后让关键项即时生效（定义在后，先声明供 SetSaveCategory 调用）
+static void SetApplyLive();
+
+// 保存当前页字段并即时生效
+static void SetSaveCategory() {
+    if (g_setCurCat < 0 || g_setCurCat >= SET_CAT_COUNT) return;
+    const int first = SET_CATS[g_setCurCat].first;
+    if (first < 0 || first >= SET_FIELD_COUNT) return;
+    for (int i = 0; i < g_setCurCount; ++i) {
+        const SettingField& f = SET_FIELDS[first + i];
+        std::wstring v;
+        if (f.kind == SK_ENUM) {
+            int sel = (int)SendMessageW(g_hSetCtl[i], CB_GETCURSEL, 0, 0);
+            int val = (sel >= 0) ? (int)SendMessageW(g_hSetCtl[i], CB_GETITEMDATA, sel, 0) : _wtoi(f.def);
+            wchar_t b[16]; wsprintfW(b, L"%d", val); v = b;
+        } else {
+            wchar_t b[1024]; b[0] = 0;
+            GetWindowTextW(g_hSetCtl[i], b, 1024);
+            if (f.kind == SK_INT) {
+                int n = _wtoi(b);
+                if (n < (int)f.lo) n = (int)f.lo;
+                if (n > (int)f.hi) n = (int)f.hi;
+                wsprintfW(b, L"%d", n);
+            } else if (f.kind == SK_DOUBLE) {
+                double d = _wtof(b);
+                if (d < f.lo) d = f.lo;
+                if (d > f.hi) d = f.hi;
+                swprintf(b, 1024, L"%.6g", d);
+            }
+            v = b;
+        }
+        SetIniStr(f.section, f.key, v.c_str());
+        // 兼容旧项：GetTtsMaxChars 优先读 [LLM] TTSMaxChars，清掉它才能让 [TTS] 新值生效
+        if (wcscmp(f.key, L"TtsMaxChars") == 0) SetIniStr(L"LLM", L"TTSMaxChars", L"");
+    }
+    SetApplyLive();   // 缓存失效 + 主题/语音/上色即时生效
+    ToastShow(L"⚙", L"设置已保存", L"已写入 llm.ini，相关选项即时生效。");
+}
+
+// 保存设置后让关键项即时生效（保存/恢复默认共用）
+static void SetApplyLive() {
+    InvalidatePromptCache();
+    InvalidateMemoryCache();
+    g_chatTheme = GetUIConfigInt(L"ChatTheme", 0, 0, 1);
+    g_ttsVoiceOn.store(_wtoi(GetIniStr(L"TTS", L"TtsEnable", L"1").c_str()) != 0);
+    if (g_hChatWnd && IsWindow(g_hChatWnd)) {
+        // ★主题改了要真正应用（EM_SETBKGNDCOLOR + 默认文字色），并同步顶栏按钮文字
+        SetButtonText(g_hChatWnd, ID_BTN_THEME, g_chatTheme ? L"☀️ 浅色" : L"🌙 深色");
+        ApplyChatTheme(g_hChatWnd);
+        UpdateWindow(g_hChatWnd);
+    }
+}
+
+// 恢复当前页字段到默认值
+static void SetResetCategory() {
+    if (g_setCurCat < 0 || g_setCurCat >= SET_CAT_COUNT) return;
+    const int first = SET_CATS[g_setCurCat].first;
+    if (first < 0 || first >= SET_FIELD_COUNT) return;
+    for (int i = 0; i < g_setCurCount; ++i) {
+        const SettingField& f = SET_FIELDS[first + i];
+        SetIniStr(f.section, f.key, f.def);
+        if (wcscmp(f.key, L"TtsMaxChars") == 0) SetIniStr(L"LLM", L"TTSMaxChars", L"");
+    }
+    SetApplyLive();                 // 主题/语音开关等即时生效
+    SetLoadCategory(g_setCurCat);   // 重新载入以刷新控件显示
+    ToastShow(L"↩", L"已恢复默认", L"本页参数已恢复为默认值并写入 llm.ini。");
+}
+
+static LRESULT CALLBACK SettingsWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    switch (m) {
+    case WM_CREATE: {
+        g_hSettingsWnd = h;
+        g_hSetList = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"",
+            WS_CHILD | WS_VISIBLE | LBS_NOTIFY | WS_VSCROLL | WS_BORDER,
+            10, 10, 160, 400, h, (HMENU)(INT_PTR)SET_ID_LIST, GetModuleHandleW(nullptr), nullptr);
+        for (int i = 0; i < SET_CAT_COUNT; ++i)
+            SendMessageW(g_hSetList, LB_ADDSTRING, 0, (LPARAM)SET_CATS[i].name);
+        SendMessageW(g_hSetList, LB_SETCURSEL, 0, 0);
+        CreateWindowExW(0, L"BUTTON", L"保存设置", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            10, 420, 150, 32, h, (HMENU)(INT_PTR)SET_ID_SAVE, GetModuleHandleW(nullptr), nullptr);
+        CreateWindowExW(0, L"BUTTON", L"恢复本页默认", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            172, 420, 150, 32, h, (HMENU)(INT_PTR)SET_ID_RESET, GetModuleHandleW(nullptr), nullptr);
+        CreateWindowExW(0, L"BUTTON", L"关闭", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            560, 420, 150, 32, h, (HMENU)(INT_PTR)SET_ID_CLOSE, GetModuleHandleW(nullptr), nullptr);
+        CreateWindowExW(0, L"STATIC", L"提示：改完点「保存设置」写回 llm.ini；数值自动钳制到合法范围。",
+            WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 462, 700, 20, h, nullptr, GetModuleHandleW(nullptr), nullptr);
+        SetLoadCategory(0);
+        break;
+    }
+    case WM_COMMAND: {
+        int id = LOWORD(w), code = HIWORD(w);
+        if (id == SET_ID_LIST && code == LBN_SELCHANGE) {
+            int sel = (int)SendMessageW(g_hSetList, LB_GETCURSEL, 0, 0);
+            if (sel >= 0 && sel < SET_CAT_COUNT) SetLoadCategory(sel);
+        } else if (id == SET_ID_SAVE) SetSaveCategory();
+        else if (id == SET_ID_RESET) SetResetCategory();
+        else if (id == SET_ID_CLOSE) DestroyWindow(h);
+        break;
+    }
+    case WM_CLOSE: DestroyWindow(h); break;
+    case WM_DESTROY:
+        g_hSettingsWnd = nullptr; g_hSetList = nullptr;
+        break;
+    default: return DefWindowProcW(h, m, w, l);
+    }
+    return 0;
+}
+
+static void OpenSettingsDialog() {
+    if (g_hSettingsWnd && IsWindow(g_hSettingsWnd)) { SetForegroundWindow(g_hSettingsWnd); return; }
+    WNDCLASSEXW wc = { sizeof(WNDCLASSEXW) };
+    wc.lpfnWndProc = SettingsWndProc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = L"MakotoSettingsClass";
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    RegisterClassExW(&wc);
+    CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST, L"MakotoSettingsClass", L"⚙ 茉子设置",
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT, 740, 520,
+        g_hwnd ? g_hwnd : nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+}
+
 // ================= 入口 =================
-int WINAPI WinMain(__in HINSTANCE hInst, __in_opt HINSTANCE, __in LPSTR, __in int) {
+// ★ 显式 extern "C"：CRT 的 invoke_main 是按【未修饰】的名字找 WinMain 的。
+//   如果编译器把它修饰成 ?WinMain@@YAH... 就会报
+//   "无法解析的外部符号 WinMain，函数 invoke_main 中引用了该符号"。
+//   顺带去掉了 __in / __in_opt 这些 SAL 注解（对入口函数没有意义，
+//   而且在缺少 sal.h 的环境里会被当成标识符，反而引入噪音）。
+extern "C" int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     if (FAILED(hr)) { MessageBoxW(nullptr, L"COM 初始化失败！", L"错误", MB_OK); return 0; }
     std::wstring exePath;
@@ -4723,8 +11392,20 @@ int WINAPI WinMain(__in HINSTANCE hInst, __in_opt HINSTANCE, __in LPSTR, __in in
     // 把相对路径 "reference\mako_ref.wav" 拼成绝对路径
     g_ttsRefAudioPath = exePath + L"\\reference\\mako_ref.wav";
     srand(GetTickCount());
-    ScanBGMDirectory(); LoadConfig();
-    StatsLoad(); StatsCheckDay(); AchCheck();      // ★ 成就系统初始化
+    ScanBGMDirectory();
+    // 顺序很重要：LoadConfig 要用"累计好感"校验存档中的服装是否已解锁，
+    // 因此必须放在 StatsLoad 之后，否则读档时好感恒为 0，服装解锁判断出错。
+    StatsLoad();
+    LoadConfig();
+    StatsCheckDay(); AchCheck();      // ★ 成就系统初始化
+    // ★ 启动即扫描两套素材（工作目录已是 exe 同级），据此决定这次跑哪条渲染路径。
+    //   规则：优先按存档里的选择；选了但素材不在就回落到另一套；只有一套能跑就用那套。
+    DetectAssets();
+    bool wantL2D = (g_wantMode == RM_LIVE2D && g_hasLive2DAssets);
+    if (!wantL2D && !g_hasFrameAssets && g_hasLive2DAssets) wantL2D = true;   // 只有模型
+    if (g_wantMode == RM_LIVE2D && !g_hasLive2DAssets && g_hasFrameAssets)
+        g_modeFallbackNotice = true;      // 选了模型却没素材：先按序列帧跑，加载完提示一次
+    g_renderMode = RM_FRAMES;             // Live2DInit 成功后才改写，避免菜单显示与画面不一致
     GdiplusStartupInput gi{};
     gi.GdiplusVersion = 1;
     GdiplusStartup(&g_gdiToken, &gi, nullptr);
@@ -4749,6 +11430,7 @@ int WINAPI WinMain(__in HINSTANCE hInst, __in_opt HINSTANCE, __in LPSTR, __in in
     g_hwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TOOLWINDOW,
         L"MakotoPet", L"常陆茉子", WS_POPUP, initX, initY, g_currentW, g_currentH, nullptr, nullptr, hInst, nullptr);
     if (g_hasSavedPos) SetWindowPos(g_hwnd, HWND_TOPMOST, g_savedPosX, g_savedPosY, g_currentW, g_currentH, SWP_NOACTIVATE);
+    DragAcceptFiles(g_hwnd, TRUE);      // ★附件：桌宠本体接受文件拖拽
     // ★ 人物位置先显示托盘图标 + 进度条，等 16 套素材全部就绪后再换成人物
     { RECT rc0; if (GetWinRect(g_hwnd, rc0)) { g_winX = rc0.left; g_winY = rc0.top; g_winPosKnown = true; } }
     g_lastTickMs = GetTickCount64();
@@ -4757,7 +11439,33 @@ int WINAPI WinMain(__in HINSTANCE hInst, __in_opt HINSTANCE, __in LPSTR, __in in
     SetTimer(g_hwnd, 1, FRAME_INTERVAL_MS, nullptr);
     ShowWindow(g_hwnd, SW_SHOWNA);          // 不抢焦点，仅显示加载画面
     UpdateLayered();
+    // 半身状态由窗口位置决定：序列帧尺寸已定，这里先按实际坐标推导；
+    // Live2D 尺寸要等模型加载，下面再刷新一次。
+    RefreshHalfBodyFromWindow();
+#if USE_LIVE2D
+    if (wantL2D && Live2DInit()) {
+        // 模型已在主线程就绪：跳过 16 套序列帧的全量解码，直接进入人物阶段。
+        // 初始化失败时落到 AnimLoadStart，按序列帧跑（缺素材时由下面的提示兜底）。
+        g_renderMode = RM_LIVE2D;
+        g_preloadDone = true;
+        // ★ 模型加载完才知道真实窗口尺寸：把存档里的位置/尺寸精确贴一次，
+        //   否则 Live2DApplyWindowSize 的底边锚定重算会把位置拽偏。
+        RestoreSavedGeometry();
+        RefreshHalfBodyFromWindow();   // Live2D 尺寸定下来后再按位置推导
+        UpdateLayered();
+        PostMessageW(g_hwnd, WM_APP_PRELOAD_DONE, 0, 0);
+    } else {
+        g_renderMode = RM_FRAMES;
+        if (wantL2D) {
+            // 素材在、但模型没起来（DLL 版本过旧 / 文件损坏）：也要提示，别静默变序列帧
+            g_modeFallbackNotice = true;
+        }
+        AnimLoadStart();
+    }
+#else
+    (void)wantL2D;
     AnimLoadStart();
+#endif
     MSG m;
     while (GetMessageW(&m, nullptr, 0, 0)) { TranslateMessage(&m); DispatchMessageW(&m); }
     CoUninitialize();

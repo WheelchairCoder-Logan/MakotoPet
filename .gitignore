@@ -10,6 +10,8 @@ prompt.txt
 
 # 素材：立绘序列帧、音频、模型（体积大且通常有版权，见 README）
 Animations/
+live2d/
+*.p2lrt
 AnimCache/
 BGM/
 Sound/

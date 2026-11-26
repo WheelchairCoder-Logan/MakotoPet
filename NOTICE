@@ -6,7 +6,7 @@ Copyright (c) 2025 MakotoPet contributors
 Licensed under the MIT License (see LICENSE).
 
 --------------------------------------------------------------------------
-1. 第三方依赖
+1. 系统依赖与可选运行时
 --------------------------------------------------------------------------
 本项目仅使用 Windows 系统自带组件，运行时不需要额外安装：
 
@@ -15,6 +15,10 @@ Licensed under the MIT License (see LICENSE).
   * 标准 C++ 运行时
 
 以上均为操作系统提供的系统库，遵循各自厂商的许可条款，本项目不随附其二进制。
+
+可选的 Live2D 运行时 p2l_runtime.dll 来自 psd2live 的 runtime/
+（MIT，https://github.com/tsunehimatoi/psd2live）。本项目通过 LoadLibraryW
+动态加载，不由本仓库分发；缺失时程序自动回退到序列帧。
 
 --------------------------------------------------------------------------
 2. 可选的本地 AI 服务（不由本项目分发）
@@ -34,6 +38,7 @@ Licensed under the MIT License (see LICENSE).
 且**不受 MIT 许可覆盖**：
 
   * 角色立绘与序列帧（Animations/）
+  * Live2D 模型（live2d/**/*.p2lrt）与运行时库（p2l_runtime.dll）
   * 语音、背景音乐、翻唱音频
   * RVC 模型文件（.pth / .index）
 
@@ -41,7 +46,7 @@ Licensed under the MIT License (see LICENSE).
 归原权利人所有。使用者需要自行取得授权，或替换为拥有合法权利的原创角色。
 
 本仓库的角色名是硬编码在代码里的（本项目并非通用框架）。若要替换角色，
-全局替换「茉子」「常陆茉子」「MakotoPet」，并替换 Animations/ 下的序列帧
-与音频文件、prompt.txt 里的人设描述即可。
+全局替换「茉子」「常陆茉子」「MakotoPet」，并替换 live2d/ 下的模型
+（或 Animations/ 下的序列帧）、音频文件、prompt.txt 里的人设描述即可。
 
 若你是权利人并认为本仓库存在侵权内容，请通过 Issue 联系，会及时处理。
