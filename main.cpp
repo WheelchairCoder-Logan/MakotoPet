@@ -6079,6 +6079,26 @@ static void DrawChatButton(const DRAWITEMSTRUCT* dis) {
     SelectObject(dis->hDC, oldPen);
     DeleteObject(pen);
 
+    // ★附件/上传按钮：用 GDI 画一个几何加号，不依赖 emoji 字形。
+    //   加号大小、粗细、颜色完全可控，深浅主题统一，也不会因字体缺字变成方块。
+    if (GetDlgCtrlID(dis->hwndItem) == ID_BTN_ATTACH) {
+        RECT arc = dis->rcItem;
+        if (pressed) OffsetRect(&arc, 0, 1);
+        int cx = (arc.left + arc.right) / 2;
+        int cy = (arc.top + arc.bottom) / 2;
+        int w  = arc.right - arc.left, h = arc.bottom - arc.top;
+        int arm = (w < h ? w : h) * 3 / 10;   // 半臂长：总长约为短边的 60%
+        if (arm < 5) arm = 5;
+        HPEN plusPen = CreatePen(PS_SOLID, 2, fg);
+        HGDIOBJ oldP = SelectObject(dis->hDC, plusPen);
+        MoveToEx(dis->hDC, cx - arm, cy, nullptr); LineTo(dis->hDC, cx + arm, cy);
+        MoveToEx(dis->hDC, cx, cy - arm, nullptr); LineTo(dis->hDC, cx, cy + arm);
+        SelectObject(dis->hDC, oldP);
+        DeleteObject(plusPen);
+        if (dis->itemState & ODS_FOCUS) DrawFocusRect(dis->hDC, &dis->rcItem);
+        return;
+    }
+
     wchar_t text[256] = {};
     GetWindowTextW(dis->hwndItem, text, 255);
     SetBkMode(dis->hDC, TRANSPARENT);
@@ -9157,8 +9177,9 @@ static LRESULT CALLBACK ChatWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         CreateWindowExW(0, L"BUTTON", g_chatTheme ? L"☀️ 浅色" : L"🌙 深色",
             WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
             316, 10, 96, 30, hwnd, (HMENU)ID_BTN_THEME, GetModuleHandleW(nullptr), nullptr);
-        // ★附件：📎 选文件 / 🎤 语音输入（两条入口与拖拽、粘贴共用 AppendAttachment）
-        CreateWindowExW(0, L"BUTTON", L"📎",
+        // ★附件：＋ 加号选文件 / 🎤 语音输入（两条入口与拖拽、粘贴共用 AppendAttachment）
+        //   加号由 DrawChatButton 用 GDI 画，此处文字仅为无障碍名称兜底。
+        CreateWindowExW(0, L"BUTTON", L"+",
             WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
             10, 324, 40, 34, hwnd, (HMENU)ID_BTN_ATTACH, GetModuleHandleW(nullptr), nullptr);
         CreateWindowExW(0, L"BUTTON", L"🎤",
